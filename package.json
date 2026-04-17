@@ -58,7 +58,7 @@
     "test": "NODE_OPTIONS=--experimental-vm-modules jest",
     "test-watch": "jest --watch"
   },
-  "version": "3.6.1",
+  "version": "3.7.0",
   "watch": {
     "build": {
       "extensions": [

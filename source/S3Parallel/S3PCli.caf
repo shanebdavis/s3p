@@ -123,6 +123,10 @@ cliCommands =
     description:  "" Scan all items in one bucket and produce a summary of all the items. Uses s3.listObjectsV2.
     options:      merge allCommandOptions,
                   summarize-folders: "" show count and size of each folder
+                  group-by: []
+                    '"js:(item) => String"'
+                    ""
+                      Provide a JS function that returns a string for each item. Summarize will track {items, size} per unique string and return them as a 'groups' map. Replaces the default size-histogram grouping.
                   advancedOptionsForAll
     args: standardFromArgs
     examples:
@@ -131,6 +135,9 @@ cliCommands =
 
       bucket: :my-bucket filter: "" "js:({Size}) => Size > 1024*1024"
       "" summarize all files larger than 1 Megabyte
+
+      bucket: :my-bucket group-by: "" "js:({Key}) => Key.split('/')[0]"
+      "" get item/size totals grouped by the first path segment
 
   compare:
     description:  "" Compare two buckets and produce a summary of their differences. Uses s3.listObjectsV2.

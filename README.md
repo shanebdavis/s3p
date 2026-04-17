@@ -151,7 +151,7 @@ require("s3p")
     bucket: "foo",
     quiet: true,
   })
-  .then(out => console.log(out));
+  .then((out) => console.log(out));
 ```
 
 Output:
@@ -167,6 +167,6 @@ Output:
 
 # Developed
 
-S3P was originally developed by [GenUI.com](https://www.genui.com/) in conjunction with [Resolution Bioscience, Inc.](http://www.resolutionbio.com/)
+S3P was originally developed in 2020 by me, Shane Delamore, while I was working at [GenUI.com](https://www.genui.com/) in conjunction with a project for [Resolution Bioscience, Inc.](http://www.resolutionbio.com/). It was open source with ResBio's permission.
 
-GenUI is a technology commercialization software consultancy based in Seattle. We accelerate software roadmaps. Please feel free to [contact GenUI](https://www.genui.com/contact) and tell us about your project. We'd love to hear from you.
+Since then I've been maintaining and improving S3P in my free time. Recently (in 2026) I've decided to fork it over to my own account and continue maintaining it from here. Nothing else has changed, though I'm not migrating any past issues or pull requests.

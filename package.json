@@ -1,9 +1,9 @@
 {
-  "author": "GenUI LLC",
+  "author": "Shane Delamore",
   "bin": {
     "s3p": "bin/s3p"
   },
-  "bugs": "https:/github.com/generalui/s3p/issues",
+  "bugs": "https:/github.com/shanebdavis/s3p/issues",
   "dependencies": {
     "@art-suite/cli": "2.2",
     "@aws-sdk/client-s3": "^3.436.0",
@@ -47,7 +47,7 @@
   "name": "s3p",
   "repository": {
     "type": "git",
-    "url": "https://github.com/generalui/s3p.git"
+    "url": "https://github.com/shanebdavis/s3p"
   },
   "scripts": {
     "build": "rsync -av  --exclude='*.caf' ./source/ ./build/\ncaf -m -c source -o build\nnpm run nn",

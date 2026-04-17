@@ -1,0 +1,65 @@
+import &StandardImport, &MinioTestHelper
+
+testObjects =
+  {} Key: :fruits/apple.txt    Body: :AAAA
+  {} Key: :fruits/banana.txt   Body: :BB
+  {} Key: :fruits/cherry.txt   Body: :CCCCCCCC
+  {} Key: :veggies/carrot.txt  Body: :DDDDDD
+  {} Key: :veggies/potato.txt  Body: :E
+
+setupTestScenario :summarize-group-by testObjects, ({endpoint, testBucket}) ->
+
+  baseOptions = {}
+    bucket:   testBucket
+    endpoint: endpoint
+    quiet:    true
+
+  test "without groupBy, no groups field is returned" ->
+    S3P.summarize baseOptions
+
+    .then (result) ->
+      assert.ok !result.groups, "" expected no groups field; got #{JSON.stringify result.groups}
+
+  test "groupBy by first path segment sums items and size per group" ->
+    S3P.summarize merge
+      baseOptions
+      groupBy: ({Key}) -> Key.split('/')[0]
+
+    .then (result) ->
+      assert.ok result.groups?, "expected groups object"
+      assert.eq result.groups.fruits.items,  3
+      assert.eq result.groups.fruits.size,   4 + 2 + 8
+      assert.eq result.groups.veggies.items, 2
+      assert.eq result.groups.veggies.size,  6 + 1
+
+  test "groupBy by extension groups across folders" ->
+    S3P.summarize merge
+      baseOptions
+      groupBy: ({Key}) ->
+        m = Key.match /\.([^.]+)$/
+        if m then m[1] else :none
+
+    .then (result) ->
+      assert.eq result.groups.txt.items, 5
+      assert.eq result.groups.txt.size,  4 + 2 + 8 + 6 + 1
+
+  test "groupBy returning a bucket string lumps items together" ->
+    S3P.summarize merge
+      baseOptions
+      groupBy: ({Size}) -> if Size < 4 then :small else :big
+
+    .then (result) ->
+      assert.eq result.groups.small.items, 2  # 2-byte and 1-byte
+      assert.eq result.groups.small.size,  2 + 1
+      assert.eq result.groups.big.items,   3
+      assert.eq result.groups.big.size,    4 + 8 + 6
+
+  test "groupBy with prefix filter only counts matching items" ->
+    S3P.summarize merge
+      baseOptions
+      prefix:  :fruits/
+      groupBy: ({Key}) -> Key.split('/')[0]
+
+    .then (result) ->
+      assert.eq result.groups.fruits.items, 3
+      assert.ok !result.groups.veggies, "" veggies should be absent

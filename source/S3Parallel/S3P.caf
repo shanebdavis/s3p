@@ -40,7 +40,7 @@ class S3P
       mapList: (l) -> each {Key} from-array l into keys with keys.push Key
 
   @summarize: (options) =>
-    options extract summarizeFolders
+    options extract summarizeFolders, groupBy
     summary =
       size: 0
       maxSize: null
@@ -49,6 +49,7 @@ class S3P
       minSizeKey: null
       sizeHistogram: {}
       folders: summarizeFolders && {}
+      groups: groupBy && {}
 
     S3C.each merge options,
       getProgress: ->
@@ -58,7 +59,8 @@ class S3P
           "" maxSize: #{} colors.green "" #{humanByteSize summary.maxSize}
         .join ' '
 
-      map: ({Size, Key}) ->
+      map: (item) ->
+        {Size, Key} = item
         floorSize = humanByteSize
           Math.pow 2, 1 + logSize = (Math.log(Size) / Math.log(2)) | 0
           0
@@ -72,6 +74,12 @@ class S3P
         g.items += 1
         g.size += Size
         g[floorSize] = (g[floorSize] | 0) + 1
+
+        if groupBy
+          groupKey = groupBy item
+          bucket = summary.groups[groupKey] ?= items: 0, size: 0
+          bucket.items++
+          bucket.size += Size
 
         if summarizeFolders
           folder = summary.folders

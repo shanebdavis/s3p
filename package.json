@@ -12,7 +12,7 @@
     "art-communication-status": "^1.6.0",
     "art-standard-lib": "^1.73.3",
     "caffeine-script-runtime": "^1.14.0",
-    "glob": "^11.0.0",
+    "glob": "^13.0.6",
     "neptune-namespaces-runtime": "^3.2.9",
     "shell-escape": "^0.2.0"
   },

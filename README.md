@@ -169,4 +169,4 @@ Output:
 
 S3P was originally developed in 2020 by me, Shane Delamore, while I was working at [GenUI.com](https://www.genui.com/) in conjunction with a project for [Resolution Bioscience, Inc.](http://www.resolutionbio.com/). It was open source with ResBio's permission.
 
-Since then I've been maintaining and improving S3P in my free time. Recently (in 2026) I've decided to fork it over to my own account and continue maintaining it from here. Nothing else has changed, though I'm not migrating any past issues or pull requests.
+Since then I've been maintaining and improving S3P in my free time. Recently (in 2026) I've decided to fork it over to my own account and continue maintaining it from here. As part of that, the ISC license copyright has been updated to me, Shane Brinkman-Davis Delamore. Nothing else has changed, though I'm not migrating any past issues or pull requests.

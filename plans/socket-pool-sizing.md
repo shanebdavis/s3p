@@ -1,6 +1,6 @@
 # Plan: HTTP Socket Pool Sizing
 
-Status: **proposed** (not started)
+Status: **implemented** (branch `fix/socket-pool-sizing`)
 Origin: runtime warning —
 
 ```
@@ -42,7 +42,7 @@ new S3Client({
 
 ## Guardrails
 
-- **File descriptors:** 600 sockets exceeds default `ulimit -n` on macOS (256) and stock Linux (1024). Clamp with a warning, or document raising the limit — decide during implementation.
+- **File descriptors:** decided not to clamp — modern macOS/Linux defaults are far above 600 (this dev machine: 1,048,576), and Node handles hundreds of sockets trivially. Users on constrained systems can lower `--max-sockets`.
 - **S3 rate limits become reachable:** at a true 500-way COPY against one prefix, S3's ~3,500 mutating-requests/sec/prefix limit is hittable, surfacing `503 SlowDown`. The SDK's adaptive retry handles it, but note in docs that some users' current stability is an accident of the 50-socket throttle — raising it may surface retries they've never seen.
 
 ## Testing

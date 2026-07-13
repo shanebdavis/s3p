@@ -93,6 +93,7 @@ toFolderOptions = # to-bucket copied here to REMOVE the required, since one
 advancedOptionsForAll =
   list-concurrency:        advanced: true argument: :100     description: ""Maximum number of simultaneous list operations
   max-list-requests:       advanced: true argument: :number  description: "" Not set by default; If set, will stop when hit. Use to limit how many requests get used.
+  max-sockets:             advanced: true argument: :number  description: "" Maximum concurrent HTTP connections to S3. Defaults to match the operation's concurrency options: list-concurrency for list-only commands, copy-concurrency + list-concurrency for copy/sync, delete-concurrency + list-concurrency for delete.
 
 advancedOptionsForCopy = merge advancedOptionsForAll,
   copy-concurrency:        advanced: true argument: :500       description: "" Maximum number of simultaneous small-copies

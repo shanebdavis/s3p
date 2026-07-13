@@ -1,0 +1,21 @@
+import &StandardImport, &TestLib
+
+describe
+  maxSockets: ->
+    test "configures http and https agents when maxSockets is set" ->
+      s3 = new S3 region: "us-east-1", maxSockets: 600
+      s3.awsSdkS3.config.requestHandler.configProvider
+      .then (config) ->
+        assert.eq config.httpsAgent.maxSockets, 600
+        assert.eq config.httpsAgent.keepAlive, true
+        Promise.resolve config.httpAgentProvider()
+        .then (httpAgent) ->
+          assert.eq httpAgent.maxSockets, 600
+          assert.eq httpAgent.keepAlive, true
+
+    # documents the SDK default this option exists to override
+    test "SDK default is 50 sockets when maxSockets is not set" ->
+      s3 = new S3 region: "us-east-1"
+      s3.awsSdkS3.config.requestHandler.configProvider
+      .then (config) ->
+        assert.eq config.httpsAgent.maxSockets, 50

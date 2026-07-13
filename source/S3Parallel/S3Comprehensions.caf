@@ -262,12 +262,15 @@ class S3Comprehensions
       region
       useAccelerateEndpoint
       endpoint
+      maxSockets
+      verbose
 
       # internal use only
       s3
       pwp = new PromiseWorkerPool listConcurrency # internal use only
 
-    s3 ?= new &Lib/S3 {} region, endpoint, useAccelerateEndpoint: !!useAccelerateEndpoint
+    maxSockets ?= listConcurrency
+    s3 ?= new &Lib/S3 {} region, endpoint, maxSockets, verbose, useAccelerateEndpoint: !!useAccelerateEndpoint
 
     if compare && map && toBucket
       throw new Error "cannot use both `compare` and `map` - use mapList instead"

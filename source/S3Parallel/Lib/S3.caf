@@ -1,5 +1,8 @@
-import &StandardImport, &FsEasy, &LibMisc, &@aws-sdk/client-s3, &@aws-sdk/lib-storage, {} &shellEscape, &util.promisify, &path
+import &StandardImport, &FsEasy, &LibMisc, &@aws-sdk/client-s3, &@aws-sdk/lib-storage, &@smithy/node-http-handler, {} &shellEscape, &util.promisify, &path
 escape = (single) -> shellEscape [] single
+
+http = &http
+https = &https
 
 fs = merge
   {createReadStream} = &fs
@@ -28,14 +31,25 @@ class S3 extends BaseClass
       useAccelerateEndpoint: boolean, default: false
       endpoint: string, default: process.env.S3_ENDPOINT
       forcePathStyle: boolean, default: true if endpoint is set
+      maxSockets: number, default: undefined (SDK default: 50)
+        Max concurrent HTTP connections. Size this to match the number of
+        concurrent SDK calls or requests queue inside the HTTP handler.
+      verbose: boolean, log client configuration on creation
 
   constructor: (options = {}) ->
     endpoint = options.endpoint ? process.env.S3_ENDPOINT
+    maxSockets = options.maxSockets
+
+    log "s3p: S3-client maxSockets: #{maxSockets ? 'SDK-default (50)'}" if options.verbose
 
     @awsSdkS3 = new S3Client merge
       region: process.env.AWS_REGION
       if endpoint
         {} endpoint, forcePathStyle: true
+      if maxSockets
+        requestHandler: new NodeHttpHandler
+          httpAgent:  new http.Agent  {} maxSockets, keepAlive: true
+          httpsAgent: new https.Agent {} maxSockets, keepAlive: true
       {region, useAccelerateEndpoint, forcePathStyle} = options
 
   @getter

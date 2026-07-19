@@ -38,8 +38,43 @@ setupTestScenario :S3Integration testKeys, ({endpoint, testBucket}) ->
     S3P.compare
       bucket:   testBucket
       toBucket: testBucket
+      prefix:   "test-folder/"
       endpoint: endpoint
       quiet:    true
 
     .then ({counts}) ->
-      assert.eq counts.same, testKeys.length
+      assert.eq counts.same, 2
+
+  test "S3P.sync actually copies files (same environment)" ->
+    S3P.sync
+      bucket:   testBucket
+      toBucket: testBucket
+      prefix:   "test-folder/"
+      toPrefix: "sync-copy/"
+      endpoint: endpoint
+      quiet:    true
+
+    .then ({finalStats}) ->
+      assert.eq finalStats.copiedFiles, 2
+
+      S3P.list
+        bucket:   testBucket
+        prefix:   "sync-copy/"
+        endpoint: endpoint
+        quiet:    true
+
+    .then (keys) ->
+      assert.eq keys.slice().sort(), ["sync-copy/hello.txt", "sync-copy/world.txt"]
+
+      # second sync: everything already there, nothing copied
+      S3P.sync
+        bucket:   testBucket
+        toBucket: testBucket
+        prefix:   "test-folder/"
+        toPrefix: "sync-copy/"
+        endpoint: endpoint
+        quiet:    true
+
+    .then ({finalStats}) ->
+      assert.eq finalStats.copiedFiles,    0
+      assert.eq finalStats.unchangedFiles, 2

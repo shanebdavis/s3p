@@ -214,8 +214,8 @@ class S3P
       toBucket: <String> [Default: options.bucket] - target bucket
       toPrefix: <String> optional - prepend to key for toKey
       toKey: (optional) <Function> (fromKey, fromBucket, toBucket, size) -> to-key-string
-      copyConcurrency       [100]                   number of active copies < 1GB using aws sdk directly
-      largeCopyConcurrency  [copyConcurrency/4]     number of active copies > 1GB using exec aws cp
+      copyConcurrency       [100]                   number of active copies < largeCopyThreshold using aws sdk directly
+      largeCopyConcurrency  [copyConcurrency/4]     number of active copies >= largeCopyThreshold (default 100MB) using exec aws cp
       maxQueueSize          [copyConcurrency * 10]  max number of copy-jobs to queue before throttling s3.lists
   @copy: (options) =>
     @_copyWrapper options, (updatedOptions) =>
@@ -244,6 +244,8 @@ class S3P
       deleteConcurrency = 500
       deletePwp
       region, endpoint, useAccelerateEndpoint
+      profile
+      credentials
       maxSockets
       listConcurrency = 100
       s3
@@ -256,7 +258,7 @@ class S3P
 
     deletePwp ?= new PromiseWorkerPool deleteConcurrency
     maxSockets ?= deleteConcurrency + listConcurrency
-    s3 ?= new &Lib/S3 {} region, endpoint, useAccelerateEndpoint, maxSockets, verbose
+    s3 ?= new &Lib/S3 {} region, endpoint, useAccelerateEndpoint, profile, credentials, maxSockets, verbose
 
     stats ?= {}
     stats.deletedFiles = 0
@@ -391,8 +393,31 @@ class S3P
       endpoint
       maxSockets
       listConcurrency = 100
+      profile
+      fromProfile
+      fromRegion
+      fromEndpoint
+      fromCredentials
+      toProfile
+      toEndpoint
+      toCredentials
     maxSockets ?= copyConcurrency + listConcurrency
-    s3 ?= new &Lib/S3 {} region, endpoint, useAccelerateEndpoint, maxSockets, verbose
+
+    if !pretend && (toProfile || toEndpoint || toCredentials)
+      throw new Error ""
+        Cross-environment copying is not yet implemented.
+        to-profile, to-endpoint and to-credentials currently work with:
+          compare
+          sync/cp with --dryrun (or --pretend)
+
+    s3 ?= new &Lib/S3 {}
+      region:       fromRegion ? region
+      endpoint:     fromEndpoint ? endpoint
+      profile:      fromProfile ? profile
+      credentials:  fromCredentials
+      useAccelerateEndpoint
+      maxSockets
+      verbose
 
     stats ?= {}
     stats.copiedBytes = 0

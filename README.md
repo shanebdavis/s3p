@@ -41,6 +41,30 @@ Read more about [S3P on Medium](https://medium.com/@shanebdavis/s3p-massively-pa
 
 s3p uses the same credentials aws-cli uses, so see their documentation: https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-configure.html
 
+You can also select a specific AWS profile with `--profile`, exactly like the aws-cli. The profile's credentials, region and endpoint_url are all respected, with standard AWS precedence (explicit options override environment variables, which override the profile's settings).
+
+# Cross-Environment Compare & Pretend Sync
+
+`compare` and `sync --dryrun` work across two completely separate environments - different AWS accounts, regions, or even S3-compatible services like MinIO. Each side gets its own client, configured the AWS-standard way: with profiles.
+
+```shell
+# ~/.aws/config
+# [profile staging]     [profile production]
+# region = us-west-2    region = us-east-1
+
+# compare the same bucket name across two accounts
+npx s3p compare --bucket my-bucket --to-bucket my-bucket \
+  --from-profile staging --to-profile production
+
+# pretend-sync: detect and report every discrepancy without copying anything
+npx s3p sync --bucket my-bucket --to-bucket my-bucket \
+  --from-profile staging --to-profile production --dryrun
+```
+
+Per-side options: `--from-profile`/`--to-profile`, `--from-region`/`--to-region` and `--from-endpoint`/`--to-endpoint`. Any side without per-side options uses your ambient environment (env vars or `--profile`), so typically you only need to add one flag for the "other" side. The programmatic API additionally accepts `fromCredentials`/`toCredentials` (any AWS SDK v3 credentials object or provider).
+
+NOTE: actual cross-environment _copying_ (two credential sets) is not yet implemented - s3p will tell you if you try. Cross-environment `compare` and `--dryrun` sync are fully supported, and same-environment copying is unchanged.
+
 # CLI
 
 There is no need to install s3p directly. As long as you have NodeJS installed, you can run s3p directly using `npx`.

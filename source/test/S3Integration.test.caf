@@ -31,3 +31,15 @@ setupTestScenario :S3Integration testKeys, ({endpoint, testBucket}) ->
         assert.ok
           key in keys
           "" Expected #{key} in #{JSON.stringify keys}
+
+  # regression: the returning-option was dropped by normalizeOptions, so compare
+  # returned only listing stats instead of its counts/bytes discrepancy summary
+  test "S3P.compare returns the discrepancy summary" ->
+    S3P.compare
+      bucket:   testBucket
+      toBucket: testBucket
+      endpoint: endpoint
+      quiet:    true
+
+    .then ({counts}) ->
+      assert.eq counts.same, testKeys.length

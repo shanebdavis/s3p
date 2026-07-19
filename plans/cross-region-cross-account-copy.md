@@ -1,7 +1,17 @@
 # Plan: Cross-Region & Cross-Account Copy Support
 
-Status: **proposed** (not started)
+Status: **Phase 0 implemented** (branch `feature/compare-cross-env`, 2026-07); Phases 1–5 not started
 Origin: customer report — "s3p couldn't reliably handle the cross-region, cross-account S3 transfer with the separate credentials and regional configuration required for our setup."
+
+## Phase 0 (DONE) — Cross-environment compare & pretend sync
+
+Shipped ahead of the copy work so discrepancies can be *detected* across environments today:
+
+- Per-side clients for listing: `fromS3`/`toS3` in `S3Comprehensions.each`; compare-listing now runs against the target's environment (and reuses one shared client when the sides match — previously `_compareList` constructed a fresh client per recursion step).
+- Config via SDK-native profiles: `S3` class accepts `profile` (S3Client config option, SDK ≥ 3.598 — no `@aws-sdk/credential-providers` dependency needed) and `credentials`. CLI: `--profile`, `--endpoint`, `--from-profile`/`--to-profile`, `--from-region`/`--to-region`, `--from-endpoint`/`--to-endpoint`.
+- Real cross-environment copying (any `to-profile`/`to-endpoint`/`to-credentials` without `--dryrun`) throws a clear not-yet-implemented error — Phase 3 removes that guard.
+- Fixed pre-existing bug: `normalizeOptions` dropped the `returning`/`into` aliases, so `compare` returned only listing stats instead of its counts/bytes discrepancy summary.
+- Test infra: second minio container (different port *and* credentials) in docker-compose; cross-env integration tests incl. real profile-file resolution. Run with `S3_ENDPOINT=http://localhost:9000 S3_ENDPOINT_B=http://localhost:9010 AWS_ACCESS_KEY_ID=testAccessKey AWS_SECRET_ACCESS_KEY=testSecretKey AWS_REGION=us-east-1 npm test`.
 
 ## Problem
 

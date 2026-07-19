@@ -10,7 +10,12 @@ standardFromToArgs =
   argument:     "[from [to]]"
   argsToOptions: processArgsIntoOptions
 
-allCommandOptions =
+environmentOptions =
+  region:       "" The AWS region of the bucket. Will use AWS_REGION environment variable if not specified.
+  profile:      "" The AWS profile to use (from ~/.aws/config and ~/.aws/credentials). Overrides the AWS_PROFILE environment variable. The profile's credentials, region and endpoint_url are all respected (standard AWS precedence applies). When set, the S3_ENDPOINT environment variable is ignored.
+  endpoint:     "" Custom S3 endpoint URL, e.g. for MinIO or other S3-compatible stores. Will use S3_ENDPOINT environment variable if not specified. Implies path-style addressing.
+
+allCommandOptions = merge environmentOptions,
   quiet:                      "" no output
   verbose:                    "" extra output
   api-example:                advanced: true description: "" Output an example of how to invoke the S3P API. Start by constructing the S3P command you want to use with the appropriate command-line options. Then append this option and execute the command. Instead of doing the actual S3P command, S3P will output the JavaScript for invoking this command using the S3P API.
@@ -22,7 +27,6 @@ allCommandOptions =
   start-after:  :key          "" Start iteratating after this key. If 'prefix' is also specified, the set-intersection of the two will be used.
   stop-at:      :key          "" Iterate up to, and including, this key. If 'prefix' is also specified, the set-intersection of the two will be used.
   fetch-owner:  "" If you want to filter on the Owner property of items, you'll need to add this option to fetch that property. Note: this adds about 10% overhead for listing items.
-  region:       "" The AWS region of the bucket. Will use AWS_REGION environment variable if not specified.
 
   pattern:
     "" string OR js:/^any-javascript-regexp/i
@@ -90,6 +94,14 @@ toFolderOptions = # to-bucket copied here to REMOVE the required, since one
   to-bucket:    :bucket-name        "" The target bucket. It can be the same bucket. (to-bucket OR to-folder required)
   to-folder:    :to-folder          "" Path to a folder in the local file system. (to-bucket OR to-folder required)
 
+crossEnvironmentOptions =
+  from-profile:   :profile-name "" AWS profile for the SOURCE side only. Default: --profile. Profiles are the standard way to give s3p two different credential sets - one per side.
+  to-profile:     :profile-name "" AWS profile for the TARGET side only. Default: --profile.
+  from-region:    :region       "" AWS region for the SOURCE side only. Default: --region.
+  to-region:      :region       "" AWS region for the TARGET side only. Default: --region.
+  from-endpoint:  :url          "" Custom S3 endpoint for the SOURCE side only. Default: --endpoint.
+  to-endpoint:    :url          "" Custom S3 endpoint for the TARGET side only. Default: --endpoint.
+
 advancedOptionsForAll =
   list-concurrency:        advanced: true argument: :100     description: ""Maximum number of simultaneous list operations
   max-list-requests:       advanced: true argument: :number  description: "" Not set by default; If set, will stop when hit. Use to limit how many requests get used.
@@ -112,6 +124,7 @@ cliCommands =
 
   list-buckets:
     description:  "" List all your S3 buckets.
+    options:      environmentOptions
 
   ls:
     description:  "" List all matching files. Uses s3.listObjectsV2.
@@ -141,12 +154,15 @@ cliCommands =
       "" get item/size totals grouped by the first path segment
 
   compare:
-    description:  "" Compare two buckets and produce a summary of their differences. Uses s3.listObjectsV2.
-    options:      merge allCommandOptions, toBucketOptions, advancedOptionsForAll
+    description:  "" Compare two buckets and produce a summary of their differences. The two buckets can live in different regions, accounts or even S3-compatible services - see the from/to options. Uses s3.listObjectsV2.
+    options:      merge allCommandOptions, toBucketOptions, crossEnvironmentOptions, advancedOptionsForAll
     args:         standardFromToArgs
     examples:
       bucket: :my-bucket to-bucket: :my-to-bucket
       "" Compare items from my-bucket with my-to-bucket. Shows how many items exist in both, only one, or are difference sizes.
+
+      bucket: :my-bucket to-bucket: :my-bucket from-profile: :staging to-profile: :production
+      "" Compare the same bucket name across two AWS accounts, using two profiles from ~/.aws/config.
 
   cp:
     description:
@@ -154,7 +170,9 @@ cliCommands =
         Copy all files from one bucket to another bucket. Uses s3.listObjectsV2, s3.copyObject and shell-exec 'aws s3 cp'.
 
         NOTE: This overwrites existing files in the target bucket. Try the 'sync' command for smarter copies when some of the files have already been copied.
-    options:      merge allCommandOptions, toBucketOptions, writeOptions, advancedOptionsForCopy, toFolderOptions
+
+        NOTE: cross-environment options (to-profile, to-endpoint) currently require --dryrun; actual cross-environment copying is not yet implemented.
+    options:      merge allCommandOptions, toBucketOptions, crossEnvironmentOptions, writeOptions, advancedOptionsForCopy, toFolderOptions
     args:         standardFromToArgs
     examples:
       bucket: :my-bucket to-bucket: :my-to-bucket
@@ -185,14 +203,30 @@ cliCommands =
       "" Copy everything from my-bucket to my-to-bucket with the prefix "2020-04-14/" with an owner's ID is 'abc123'.
 
   sync:
-    description:  "" Only copy files which do not exist in the target bucket. Uses s3.listObjectsV2, s3.copyObject and shell-exec 'aws s3 cp'.
-    options:      merge allCommandOptions, toBucketOptions, writeOptions, advancedOptionsForCopy,
+    description:
+      """
+        Copy only what's missing or different. Both buckets are listed in parallel and diffed by key, comparing byte-SIZE ONLY (no timestamps, no checksums, no content):
+
+          - key missing in target:               copied
+          - key in both, sizes differ:           copied only with --overwrite, otherwise just reported
+          - key in target only:                  never deleted - a suggested 'aws s3 rm' is logged for you to run
+          - key in both, same size:              skipped, even if the contents differ
+
+        Use --dryrun to see exactly what would happen without copying anything.
+
+        Uses s3.listObjectsV2, s3.copyObject and shell-exec 'aws s3 cp'.
+
+        NOTE: cross-environment options (to-profile, to-endpoint) currently require --dryrun, which detects and reports all discrepancies without copying; actual cross-environment copying is not yet implemented.
+    options:      merge allCommandOptions, toBucketOptions, crossEnvironmentOptions, writeOptions, advancedOptionsForCopy,
                   overwrite: "" If set, sync will overwrite existing files with different file sizes.
     args:         standardFromToArgs
 
     examples:
       bucket: :my-bucket to-bucket: :my-to-bucket
       "" Copy everything from my-bucket to my-to-bucket
+
+      bucket: :my-bucket to-bucket: :my-bucket from-profile: :staging to-profile: :production dryrun: true
+      "" Pretend-sync across two AWS accounts: detect and report every discrepancy without copying anything.
 
   delete:
     description:
@@ -280,9 +314,12 @@ main: (options) ->
       """
         S3 summarize, compare, copy, sync and more with massively parallel power.
 
-        Configure AWS credentials with environment variables:
+        Configure AWS credentials with environment variables or --profile:
           s3p uses the same creds as the aws-cli. Learn more:
           https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-configure.html
+
+        Working across two accounts/regions/endpoints? See the
+        --from-profile/--to-profile (and related) options on compare, cp and sync.
 
         Source: https://github.com/generalui/s3p
 

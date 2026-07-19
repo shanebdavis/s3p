@@ -35,7 +35,7 @@ wrapCommandWithArgsProcessing = (command) ->
       if fromCli then if verbose then info else null
       else if verbose then merge info, {} items else items
 
-  listBuckets:  wrapCommandWithArgsProcessing -> new &lib/S3().listBuckets()
+  listBuckets:  wrapCommandWithArgsProcessing (options) -> new &lib/S3(options).listBuckets()
   summarize:    wrapCommandWithArgsProcessing &S3P.summarize
   compare:      wrapCommandWithArgsProcessing &S3P.compare
   cp:           wrapCommandWithArgsProcessing &S3P.copy

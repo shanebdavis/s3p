@@ -95,12 +95,19 @@ toFolderOptions = # to-bucket copied here to REMOVE the required, since one
   to-folder:    :to-folder          "" Path to a folder in the local file system. (to-bucket OR to-folder required)
 
 crossEnvironmentOptions =
-  from-profile:   :profile-name "" AWS profile for the SOURCE side only. Default: --profile. Profiles are the standard way to give s3p two different credential sets - one per side.
-  to-profile:     :profile-name "" AWS profile for the TARGET side only. Default: --profile.
-  from-region:    :region       "" AWS region for the SOURCE side only. Default: --region.
-  to-region:      :region       "" AWS region for the TARGET side only. Default: --region.
-  from-endpoint:  :url          "" Custom S3 endpoint for the SOURCE side only. Default: --endpoint.
-  to-endpoint:    :url          "" Custom S3 endpoint for the TARGET side only. Default: --endpoint.
+  from-profile:   :profile-name "" AWS profile for the SOURCE side only. Default: --profile. Profiles are the standard way to give s3p two different credential sets - one per side. IMPORTANT: two different profiles force STREAM mode - every byte flows through this machine. Cross-ACCOUNT copies do NOT require two profiles; see --to-profile.
+  to-profile:
+    :profile-name
+    ""
+      AWS profile for the TARGET side only. Default: --profile.
+
+      IMPORTANT: setting per-side profiles forces STREAM mode - every byte flows through this machine, and your bandwidth + --stream-memory become the limits.
+
+      Cross-ACCOUNT copies do NOT require two profiles. If ONE principal can read the source and write the destination (e.g. the source account grants your user access with a bucket policy), use plain --profile with that principal instead: copies stay server-side, entirely in-cloud, and s3p is pure orchestration - fine to run over home broadband. Only use two profiles when the two sides truly cannot share a principal.
+  from-region:    :region       "" AWS region for the SOURCE side only. Default: --region. A region difference alone does NOT force stream mode - cross-region copies stay server-side.
+  to-region:      :region       "" AWS region for the TARGET side only. Default: --region. A region difference alone does NOT force stream mode - cross-region copies stay server-side.
+  from-endpoint:  :url          "" Custom S3 endpoint for the SOURCE side only. Default: --endpoint. Different endpoints per side force STREAM mode (see --to-profile).
+  to-endpoint:    :url          "" Custom S3 endpoint for the TARGET side only. Default: --endpoint. Different endpoints per side force STREAM mode (see --to-profile).
 
 advancedOptionsForAll =
   list-concurrency:        advanced: true argument: :100     description: ""Maximum number of simultaneous list operations
@@ -108,15 +115,28 @@ advancedOptionsForAll =
   max-sockets:             advanced: true argument: :number  description: "" Maximum concurrent HTTP connections to S3. Defaults to match the operation's concurrency options: list-concurrency for list-only commands, copy-concurrency + list-concurrency for copy/sync, delete-concurrency + list-concurrency for delete.
 
 advancedOptionsForCopy = merge advancedOptionsForAll,
-  copy-concurrency:        advanced: true argument: :500       description: "" Maximum number of simultaneous small-copies
-  large-copy-concurrency:  advanced: true argument: :75        description: "" Maximum number of simultaneous large-copies
+  copy-concurrency:        advanced: true argument: :500       description: "" SERVER-SIDE copy mode only: maximum number of simultaneous small-copies (single copyObject calls). Stream mode ignores this - see --stream-concurrency.
+  large-copy-concurrency:  advanced: true argument: :75        description: "" SERVER-SIDE copy mode only: maximum number of simultaneous large-copies (parallel multipart uploadPartCopy). Server-side copies are cheap requests, so this bounds request fan-out, not memory. Stream mode ignores this - see --stream-concurrency.
+  stream-concurrency:      advanced: true argument: :number    description: "" STREAM mode only: number of files actively streaming through this machine at once. Default: derived from --stream-memory. Streaming many small files? Raise this (or --stream-memory) - the default is sized for worst-case large files.
+  stream-memory:           advanced: true argument: :536870912 description: "" STREAM mode only: approximate local memory budget for streaming buffers. Each actively-streaming file buffers up to 4 parts of 16MB (64MB worst-case), so the default 512MB allows 8 concurrent files. Ignored when --stream-concurrency is set explicitly.
   max-queue-size:          advanced: true argument: :50000     description: "" Maximum number of files that can be queued for copying before list-reading is throttled.
   large-copy-threshold:    advanced: true argument: :104857600 description:
     ""
-      Files larger than this byte-size will use the large-copy strategy, which is currently a
-      shell-exec of 'aws s3 cp'. Currently this must be set <= 5368709120 (5 gigabytes).
-      This is s3.copyObject's max supported size, so S3P must shell-exec aws-cli for larger files.
+      Files at or above this byte-size use the large-copy strategy: server-side parallel
+      multipart copy (s3.uploadPartCopy - no data flows through this machine). Smaller files
+      use a single s3.copyObject call. Since s3.copyObject hard-fails above 5368709120
+      (5 gigabytes), files that big always use multipart regardless of this setting.
       100 megabytes, the default, has been tested to be a good selection for maximum performance.
+  large-copy-part-size:        advanced: true argument: :104857600 description: "" Byte-size of each server-side multipart-copy part. Auto-raised when needed to keep a file under S3's 10000-part limit.
+  large-copy-part-concurrency: advanced: true argument: :4         description: "" Simultaneous uploadPartCopy calls per large file.
+  copy-mode:                   advanced: true argument: :auto      description:
+    ""
+      auto (default): server-side copy when both sides share credentials and endpoint; otherwise
+      stream mode - every byte flows through this machine via getObject -> multipart upload
+      (required when the two sides use different credentials, since one request has one signer).
+      server: force server-side copy. stream: force stream mode.
+      TIP: to copy cross-account WITHOUT streaming, use one principal that can access both
+      buckets (bucket policy) with plain --profile - see --to-profile for details.
 
 cliCommands =
   version:
@@ -171,7 +191,11 @@ cliCommands =
 
         NOTE: This overwrites existing files in the target bucket. Try the 'sync' command for smarter copies when some of the files have already been copied.
 
-        NOTE: cross-environment options (to-profile, to-endpoint) currently require --dryrun; actual cross-environment copying is not yet implemented.
+        Two copy modes (see --copy-mode):
+
+        SERVER-SIDE (default whenever both sides share one set of credentials and one endpoint): s3.copyObject, or parallel multipart s3.uploadPartCopy for large files. ZERO bytes flow through this machine - s3p is pure orchestration, so even huge in-cloud moves (including cross-REGION and cross-ACCOUNT via a shared principal + bucket policy) run fine from home broadband.
+
+        STREAM (automatic when the two sides use DIFFERENT credentials or endpoints, e.g. --to-profile/--to-endpoint): server-side copy is impossible (one request = one signer), so every byte flows through this machine: getObject -> multipart upload. Your bandwidth and --stream-memory are the limits; for big transfers run s3p near one of the buckets. Before reaching for stream mode, check whether one principal could access both buckets - see --to-profile.
     options:      merge allCommandOptions, toBucketOptions, crossEnvironmentOptions, writeOptions, advancedOptionsForCopy, toFolderOptions
     args:         standardFromToArgs
     examples:
@@ -214,9 +238,11 @@ cliCommands =
 
         Use --dryrun to see exactly what would happen without copying anything.
 
-        Uses s3.listObjectsV2, s3.copyObject and shell-exec 'aws s3 cp'.
+        Two copy modes (see --copy-mode):
 
-        NOTE: cross-environment options (to-profile, to-endpoint) currently require --dryrun, which detects and reports all discrepancies without copying; actual cross-environment copying is not yet implemented.
+        SERVER-SIDE (default whenever both sides share one set of credentials and one endpoint): s3.copyObject, or parallel multipart s3.uploadPartCopy for large files. ZERO bytes flow through this machine - s3p is pure orchestration, so even huge in-cloud moves (including cross-REGION and cross-ACCOUNT via a shared principal + bucket policy) run fine from home broadband.
+
+        STREAM (automatic when the two sides use DIFFERENT credentials or endpoints, e.g. --to-profile/--to-endpoint): server-side copy is impossible (one request = one signer), so every byte flows through this machine: getObject -> multipart upload. Your bandwidth and --stream-memory are the limits; for big transfers run s3p near one of the buckets. Before reaching for stream mode, check whether one principal could access both buckets - see --to-profile.
     options:      merge allCommandOptions, toBucketOptions, crossEnvironmentOptions, writeOptions, advancedOptionsForCopy,
                   overwrite: "" If set, sync will overwrite existing files with different file sizes.
     args:         standardFromToArgs
@@ -227,6 +253,9 @@ cliCommands =
 
       bucket: :my-bucket to-bucket: :my-bucket from-profile: :staging to-profile: :production dryrun: true
       "" Pretend-sync across two AWS accounts: detect and report every discrepancy without copying anything.
+
+      bucket: :my-bucket to-bucket: :my-bucket from-profile: :staging to-profile: :production
+      "" Really sync across two AWS accounts: file data streams through this machine, metadata (ContentType etc) is preserved.
 
   delete:
     description:

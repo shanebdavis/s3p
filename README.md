@@ -21,13 +21,10 @@ Read more about [S3P on Medium](https://medium.com/@shanebdavis/s3p-massively-pa
 # Requirements
 
 1. [NodeJS](https://nodejs.org/en/download/)
-2. [AWS-CLI](https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-install.html)
 
-   The `aws-cli` is required for copying large files. By default, files larger than 100 megabytes are copied with `aws-cli`. This is a good compromise for performance. However, you can change that threshold to 5 gigabytes with the `--large-copy-threshold` option.
+   > The `aws-cli` is no longer required. Large files (>= 100 megabytes by default, see `--large-copy-threshold`) are now copied with server-side parallel multipart copy (`s3.uploadPartCopy`) - pure JavaScript, no data flows through your machine, and files larger than 5 gigabytes (s3.copyObject's hard limit) just work.
 
-   > Why? The `aws-sdk` does not support coping files larger than 5 gigabytes without a much more complicated solution.
-
-3. Key names must use a limited character set:
+2. Key names must use a limited character set:
    ```
    <space>
    !"#$%&'()*+,-./
@@ -43,9 +40,9 @@ s3p uses the same credentials aws-cli uses, so see their documentation: https://
 
 You can also select a specific AWS profile with `--profile`, exactly like the aws-cli. The profile's credentials, region and endpoint_url are all respected, with standard AWS precedence (explicit options override environment variables, which override the profile's settings).
 
-# Cross-Environment Compare & Pretend Sync
+# Cross-Environment Compare, Sync & Copy
 
-`compare` and `sync --dryrun` work across two completely separate environments - different AWS accounts, regions, or even S3-compatible services like MinIO. Each side gets its own client, configured the AWS-standard way: with profiles.
+`compare`, `sync` and `cp` work across two completely separate environments - different AWS accounts, regions, or even S3-compatible services like MinIO. Each side gets its own client, configured the AWS-standard way: with profiles.
 
 ```shell
 # ~/.aws/config
@@ -59,11 +56,19 @@ npx s3p compare --bucket my-bucket --to-bucket my-bucket \
 # pretend-sync: detect and report every discrepancy without copying anything
 npx s3p sync --bucket my-bucket --to-bucket my-bucket \
   --from-profile staging --to-profile production --dryrun
+
+# real sync across two accounts
+npx s3p sync --bucket my-bucket --to-bucket my-bucket \
+  --from-profile staging --to-profile production
 ```
 
 Per-side options: `--from-profile`/`--to-profile`, `--from-region`/`--to-region` and `--from-endpoint`/`--to-endpoint`. Any side without per-side options uses your ambient environment (env vars or `--profile`), so typically you only need to add one flag for the "other" side. The programmatic API additionally accepts `fromCredentials`/`toCredentials` (any AWS SDK v3 credentials object or provider).
 
-NOTE: actual cross-environment _copying_ (two credential sets) is not yet implemented - s3p will tell you if you try. Cross-environment `compare` and `--dryrun` sync are fully supported, and same-environment copying is unchanged.
+How copying works across environments: when both sides share credentials and endpoint, copies are server-side (`s3.copyObject`, or parallel multipart `s3.uploadPartCopy` for large files) - **zero bytes flow through your machine**, even cross-region, so s3p remains pure orchestration you can run from home broadband. When the sides have *different* credentials or endpoints, server-side copy is impossible (one request = one signer), so s3p automatically streams each file through your machine: `getObject` from the source, multipart upload to the target, preserving `ContentType`, `CacheControl`, custom metadata, etc. Force a specific strategy with `--copy-mode server|stream`.
+
+**Cross-account does NOT require streaming.** If one principal can read the source and write the destination - typically the source account grants your destination-account user read access with a bucket policy - then use plain `--profile` with that principal and copies stay server-side, entirely in-cloud. Reserve two-profile stream mode for when the accounts truly cannot share a principal.
+
+Stream mode notes: your machine's bandwidth is the bottleneck - for big transfers, run s3p on an EC2 instance in one of the two regions. Concurrency is bounded by local memory, not request count: each actively-streaming file buffers up to 64MB, and `--stream-memory` (default 512MB, allowing 8 concurrent files) or `--stream-concurrency` control the commitment. Streaming lots of small files? Raise them.
 
 # CLI
 

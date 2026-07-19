@@ -4,6 +4,9 @@ fs    = &fs
 os    = &os
 path  = &path
 
+# selective import: &@aws-sdk/client-s3 exports a class named S3 that would shadow s3p's S3
+{GetObjectCommand, HeadObjectCommand} = &@aws-sdk/client-s3
+
 ##
   Cross-environment integration tests: two independent MinIO instances with
   DIFFERENT endpoints and DIFFERENT credentials (see docker-compose.yml).
@@ -121,19 +124,84 @@ setupCrossEnvTestScenario "CompareCrossEnv", keysA, keysB, ({endpoint, endpointB
     .then (buckets) ->
       assert.eq true, buckets[testBucket]?, "" expected bucket #{testBucket} in #{JSON.stringify buckets}
 
-  test "real cross-environment sync is rejected until copy support lands" ->
-    caught = null
-    try
+  test "real cross-environment sync streams missing + changed files to the target" ->
+    S3P.sync
+      bucket:     testBucket
+      toBucket:   testBucket
+      prefix:     testPrefix
+      overwrite:  true
+      quiet:      true
+      toEndpoint: endpointB
+      toProfile:  profileName
+
+    .then ({finalStats}) ->
+      assert.eq finalStats.copiedFiles, 2 # only-in-a.txt + replace.txt (overwrite)
+
+      Promise.all []
+        s3ClientB.send new GetObjectCommand Bucket: testBucket, Key: "cross-env/only-in-a.txt"
+        .then (r) -> r.Body.transformToString()
+
+        s3ClientB.send new GetObjectCommand Bucket: testBucket, Key: "cross-env/replace.txt"
+        .then (r) -> r.Body.transformToString()
+
+    .then ([onlyInA, replaced]) ->
+      assert.eq onlyInA,  "a"
+      assert.eq replaced, "0123456789"
+
+      # target is now in sync: a second sync copies nothing
       S3P.sync
         bucket:     testBucket
         toBucket:   testBucket
+        prefix:     testPrefix
         quiet:      true
         toEndpoint: endpointB
         toProfile:  profileName
-    catch error
-      caught = error
 
-    assert.eq true, /not yet implemented/i.test("#{caught}"), "" expected a not-yet-implemented error, got: #{caught}
+    .then ({finalStats}) ->
+      assert.eq finalStats.copiedFiles,    0
+      assert.eq finalStats.unchangedFiles, 3
+
+  test "stream copy preserves metadata (ContentType + custom Metadata)" ->
+    putTestObjects []
+      {} Key: "cross-env-meta/styled.css", Body: "body{}", ContentType: "text/css", Metadata: source: "env-a"
+
+    .then ->
+      S3P.copy
+        bucket:     testBucket
+        toBucket:   testBucket
+        prefix:     "cross-env-meta/"
+        quiet:      true
+        toEndpoint: endpointB
+        toProfile:  profileName
+
+    .then ->
+      s3ClientB.send new HeadObjectCommand Bucket: testBucket, Key: "cross-env-meta/styled.css"
+
+    .then (head) ->
+      assert.eq head.ContentType,     "text/css"
+      assert.eq head.Metadata.source, "env-a"
+      assert.eq head.ContentLength,   6
+
+  test "large files stream cross-environment (routed through the large-copy pool)" ->
+    size = 12 * 1024 ** 2
+    putTestObjects []
+      {} Key: "cross-env-large/big.bin", Body: Buffer.alloc size, "y"
+
+    .then ->
+      S3P.copy
+        bucket:             testBucket
+        toBucket:           testBucket
+        prefix:             "cross-env-large/"
+        quiet:              true
+        toEndpoint:         endpointB
+        toProfile:          profileName
+        largeCopyThreshold: 5 * 1024 ** 2
+
+    .then ->
+      s3ClientB.send new HeadObjectCommand Bucket: testBucket, Key: "cross-env-large/big.bin"
+
+    .then (head) ->
+      assert.eq head.ContentLength, size
 
 describe
   crossEnvironmentClientConfig: ->

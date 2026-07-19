@@ -1,11 +1,18 @@
 import &StandardImport, &MinioTestHelper
 
+fs    = &fs
+os    = &os
+path  = &path
+
+# selective import: &@aws-sdk/client-s3 exports a class named S3 that would shadow s3p's S3
+{GetObjectCommand, HeadObjectCommand} = &@aws-sdk/client-s3
+
 testKeys =
   :test-folder/hello.txt
   :test-folder/world.txt
   :other/file.txt
 
-setupTestScenario :S3Integration testKeys, ({endpoint, testBucket}) ->
+setupTestScenario :S3Integration testKeys, ({endpoint, testBucket, s3Client}) ->
 
   test "ls returns array of key strings" ->
     ls
@@ -78,3 +85,51 @@ setupTestScenario :S3Integration testKeys, ({endpoint, testBucket}) ->
     .then ({finalStats}) ->
       assert.eq finalStats.copiedFiles,    0
       assert.eq finalStats.unchangedFiles, 2
+
+  test "large files use pure-JS server-side multipart copy (no aws-cli)" ->
+    size = 12 * 1024 ** 2
+    putTestObjects []
+      {} Key: "multipart/big.bin", Body: Buffer.alloc(size, "x"), ContentType: "application/x-s3p-test", Metadata: flavor: "large"
+
+    .then ->
+      S3P.copy
+        bucket:             testBucket
+        toBucket:           testBucket
+        prefix:             "multipart/"
+        toPrefix:           "multipart-copy/"
+        endpoint:           endpoint
+        quiet:              true
+        largeCopyThreshold: 5 * 1024 ** 2
+        largeCopyPartSize:  5 * 1024 ** 2
+
+    .then ({finalStats}) ->
+      assert.eq finalStats.copiedFiles, 1
+
+      s3Client.send new HeadObjectCommand Bucket: testBucket, Key: "multipart-copy/big.bin"
+
+    .then (head) ->
+      assert.eq head.ContentLength, size
+      # multipart ETags end in -partCount: 12MB at 5MB parts = 3 parts
+      assert.eq true, /-3"?$/.test(head.ETag), "" expected a 3-part multipart ETag, got: #{head.ETag}
+      # metadata must be carried explicitly by multipart copy - verify it was
+      assert.eq head.ContentType,     "application/x-s3p-test"
+      assert.eq head.Metadata.flavor, "large"
+
+  test "local file upload to S3 works (lib-storage Upload client fix)" ->
+    fromFolder = fs.mkdtempSync path.join os.tmpdir(), "s3p-upload-test-"
+    fs.writeFileSync path.join(fromFolder, "hello-upload.txt"), "uploaded!"
+
+    s3 = new S3 endpoint: endpoint
+    s3.copy
+      bucket:     testBucket # _normalizeCopyOptions requires a bucket even for local sources
+      fromFolder: fromFolder
+      key:        "hello-upload.txt"
+      toBucket:   testBucket
+      toKey:      "local-upload/hello-upload.txt"
+      size:       9
+
+    .then ->
+      s3Client.send new GetObjectCommand Bucket: testBucket, Key: "local-upload/hello-upload.txt"
+
+    .then (r) -> r.Body.transformToString()
+    .then (body) -> assert.eq body, "uploaded!"

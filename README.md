@@ -42,6 +42,8 @@ You can also select a specific AWS profile with `--profile`, exactly like the aw
 
 # Cross-Environment Compare, Sync & Copy
 
+> ⚠️ **New feature - cross-environment COPYING is under-tested.** Cross-account `compare` and `sync --dryrun` (listing and diffing two buckets with two credential sets) have been tested against real AWS accounts and work great. Actual cross-account *copying* - especially stream mode - has so far only been verified against local MinIO test environments, not real AWS. Before trusting it with important data: run `sync --dryrun` first, try a small prefix, and verify the results (sizes, metadata) on the target. Feedback welcome!
+
 `compare`, `sync` and `cp` work across two completely separate environments - different AWS accounts, regions, or even S3-compatible services like MinIO. Each side gets its own client, configured the AWS-standard way: with profiles.
 
 ```shell
@@ -110,7 +112,7 @@ In addition to performance, S3P provides flexible options for custom list, copyi
 
 # Performance
 
-Surprisingly, you don't even need to run S3P in the cloud to see much of its benefits. You can run it on your local machine and, since S3 copying never goes directly through S3P, it doesn't use up any AWS bandwidth.
+Surprisingly, you don't even need to run S3P in the cloud to see much of its benefits. You can run it on your local machine and, since server-side S3 copying never goes directly through S3P, it doesn't use up any of your bandwidth. (The one exception: cross-environment stream mode, where two credential sets make server-side copy impossible - see "Cross-Environment Compare, Sync & Copy" above.)
 
 S3-bucket-listing performance can hit almost ~~20,000~~ 50,000 items per second (as-of S3Pv3.5).
 
@@ -144,7 +146,50 @@ npx s3p cp --help
 
 # API
 
-All the capabilities of the CLI are also available as an API. To learn the API, first learn the CLI options, and then, to learn the API call for a specific CLI command, run that command on the command-line with the `--api-example` option. This will output example JavaScript code for invoking that command programmatically.
+All the capabilities of the CLI are also available as an API - every command is an exported async function:
+
+```javascript
+const s3p = require("s3p");
+```
+
+## Exported Functions
+
+Each returns a Promise. Options are the lowerCamelCase equivalents of the CLI options (`--to-bucket` → `toBucket`, `--from-profile` → `fromProfile`, ...).
+
+| function                | description                                                                                                             |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `ls(options)`           | list matching keys; resolves to an array of key strings (or full items with `raw: true`)                                |
+| `listBuckets(options)`  | resolves to a map of bucket names to creation dates                                                                      |
+| `summarize(options)`    | scan a bucket and resolve to size/count statistics, size histograms, and optional per-folder or custom `groupBy` totals |
+| `compare(options)`      | diff two buckets (any two environments); resolves to `{counts, bytes}` - same, needToCopy, needToReplace, needToDelete  |
+| `cp(options)`           | copy everything from one bucket/folder to another; resolves to `{finalStats}`                                            |
+| `sync(options)`         | copy only what's missing or different (see the sync CLI help for the exact rules); resolves to `{finalStats}`           |
+| `delete(options)`       | delete matching keys (requires `confirmDeleteItemsFromBucket`); resolves to `{finalStats}`                               |
+| `each(options)`         | custom iteration: your `map`/`mapList` function is called for every matching item                                        |
+| `map(options)`          | map-reduce over all matching items with `map`, `reduce`, and optional `finally` functions                                |
+| `version`               | s3p's version string (a property, not a function)                                                                        |
+
+API-only options, in addition to everything the CLI accepts:
+
+- `fromCredentials` / `toCredentials`: any AWS SDK v3 credentials object or provider, per side - an alternative to `fromProfile`/`toProfile` for cross-environment operations
+- `credentials`: same, applied to both sides
+- `filter`, `toKey`, `map`, `mapList`, `reduce`, `finally`: plain JavaScript functions (the CLI takes `js:`-prefixed strings)
+
+Example - compare two accounts programmatically:
+
+```javascript
+const { counts, bytes } = await s3p.compare({
+  bucket: "my-bucket",
+  toBucket: "my-bucket",
+  fromProfile: "staging",
+  toProfile: "production",
+  quiet: true,
+});
+```
+
+## Learning API Options via the CLI
+
+To learn the API call for a specific CLI command, run that command on the command-line with the `--api-example` option. This will output example JavaScript code for invoking that command programmatically.
 
 > NOTE: When you use `--api-example` on the command-line, your command won't actually run. S3P will _only_ output the JavaScript equivalent of the CLI command to the console and then quit.
 

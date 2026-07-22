@@ -1,5 +1,21 @@
-import &StandardImport, &FsEasy, &LibMisc, &@aws-sdk/client-s3, &@aws-sdk/lib-storage, &@smithy/node-http-handler, {} &shellEscape, &util.promisify, &path
-escape = (single) -> shellEscape [] single
+import &StandardImport, &FsEasy, &LibMisc, &@aws-sdk/client-s3, &@aws-sdk/lib-storage, &@smithy/node-http-handler, {} &path
+
+# NOTE: must be the local Lib/PromiseWorkerPool - art-standard-lib exports a
+# same-named class whose queue() resolves with ALL results, not the job's own
+PromiseWorkerPool = &PromiseWorkerPool
+
+# s3.copyObject hard-fails above this size; larger objects require multipart UploadPartCopy
+maxCopyObjectSize = 5 * 1024 ** 3
+
+# metadata CopyObject preserves automatically, but multipart-copy and stream-copy must carry explicitly
+preservedMetadataKeys =
+  :ContentType
+  :ContentEncoding
+  :ContentDisposition
+  :ContentLanguage
+  :CacheControl
+  :Expires
+  :Metadata
 
 http = &http
 https = &https
@@ -29,15 +45,24 @@ class S3 extends BaseClass
     IN: options:
       region: string, default: process.env.AWS_REGION
       useAccelerateEndpoint: boolean, default: false
-      endpoint: string, default: process.env.S3_ENDPOINT
+      endpoint: string, default: process.env.S3_ENDPOINT (env var ignored when profile is set)
       forcePathStyle: boolean, default: true if endpoint is set
+      profile: string - an AWS profile from ~/.aws/config & ~/.aws/credentials
+        Resolved natively by the AWS SDK (requires @aws-sdk/client-s3 >= 3.598):
+        credentials (including SSO, assumed roles and credential_process),
+        region and endpoint_url all come from the profile unless explicitly
+        overridden by other options. Standard AWS precedence still applies
+        (e.g. the AWS_REGION env var overrides the profile's region).
+      credentials: AwsCredentialIdentity or provider - passed through to S3Client
       maxSockets: number, default: undefined (SDK default: 50)
         Max concurrent HTTP connections. Size this to match the number of
         concurrent SDK calls or requests queue inside the HTTP handler.
       verbose: boolean, log client configuration on creation
 
   constructor: (options = {}) ->
-    endpoint = options.endpoint ? process.env.S3_ENDPOINT
+    profile = options.profile
+    endpoint = options.endpoint
+    endpoint ?= process.env.S3_ENDPOINT if !profile
     maxSockets = options.maxSockets
 
     log "s3p: S3-client maxSockets: #{maxSockets ? 'SDK-default (50)'}" if options.verbose
@@ -50,7 +75,7 @@ class S3 extends BaseClass
         requestHandler: new NodeHttpHandler
           httpAgent:  new http.Agent  {} maxSockets, keepAlive: true
           httpsAgent: new https.Agent {} maxSockets, keepAlive: true
-      {region, useAccelerateEndpoint, forcePathStyle} = options
+      {region, useAccelerateEndpoint, forcePathStyle, profile, credentials} = options
 
   @getter
     s3: ->
@@ -60,6 +85,11 @@ class S3 extends BaseClass
       copyObject:     (options = {}) -> Promise.resolve @awsSdkS3.send new CopyObjectCommand options
       deleteObject:   (options = {}) -> Promise.resolve @awsSdkS3.send new DeleteObjectCommand options
       headObject:     (options = {}) -> Promise.resolve @awsSdkS3.send new HeadObjectCommand options
+
+      createMultipartUpload:   (options = {}) -> Promise.resolve @awsSdkS3.send new CreateMultipartUploadCommand options
+      uploadPartCopy:          (options = {}) -> Promise.resolve @awsSdkS3.send new UploadPartCopyCommand options
+      completeMultipartUpload: (options = {}) -> Promise.resolve @awsSdkS3.send new CompleteMultipartUploadCommand options
+      abortMultipartUpload:    (options = {}) -> Promise.resolve @awsSdkS3.send new AbortMultipartUploadCommand options
 
 
   listBuckets: ->
@@ -106,7 +136,7 @@ class S3 extends BaseClass
   ## copy
     IN:
       options:
-        size:       Bytes (optional) if provided and if bigger than the max size allowed by copyObject, largeCopy is used
+        size:       Bytes (optional) if provided and >= largeCopyThreshold (or > 5GB, copyObject's max), server-side multipart largeCopy is used
         bucket:     <String> (ignored if both from-bucket and to-bucket are provided)
         fromBucket: from-bucket (default: bucket)
         toBucket:   to-bucket (default: bucket)
@@ -116,6 +146,14 @@ class S3 extends BaseClass
         fromFolder: string
 
         toFolder:   local folder
+
+        toS3:       <S3> (default: this) - the destination-side S3 instance; server-side
+                    copy commands are sent to it (correct region/endpoint), while reads
+                    (getObject) use this instance
+        streamCopy: <Boolean> - stream every byte through this machine:
+                    getObject (this) -> lib-storage Upload (toS3). Required when the two
+                    sides use different credentials or endpoints - server-side copy is
+                    impossible there (one request = one signer).
     OUT:
       Promise.then -> see https://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/S3.html#copyObject-property > Callback > Parameters
         {} CopyObjectResult, ...
@@ -129,12 +167,22 @@ class S3 extends BaseClass
       pretend, verbose
       size
 
-    if size >= largeCopyThreshold
+    toS3 = options.toS3 ? this
+    streamCopy = options.streamCopy
+
+    # copyObject hard-fails above 5GB, so multipart is forced there regardless of threshold
+    multipartThreshold = Math.min largeCopyThreshold ? maxCopyObjectSize, maxCopyObjectSize
+
+    if !fromFolder && !toFolder && !streamCopy && size >= multipartThreshold
       @largeCopy {}
-        commonCopyOptions: @extractCommonCopyOptions options
-        fromBucket, fromFolder, fromKey
-        toBucket, toFolder, toKey
+        fromBucket, fromKey
+        toBucket, toKey
         pretend, verbose
+        size
+        toS3
+        sdkCopyOptions:           @_getCommonCopyOptionsForSdk options
+        largeCopyPartSize:        options.largeCopyPartSize
+        largeCopyPartConcurrency: options.largeCopyPartConcurrency
 
     else
       copyOptions = merge
@@ -155,6 +203,7 @@ class S3 extends BaseClass
         log.unquoted merge {}
           copyObject: copyOptions
           toLocalFile
+          streamCopy
 
       if pretend
         timeout 1 -> pretend: true
@@ -163,7 +212,7 @@ class S3 extends BaseClass
         fromFilePath = path.join fromFolder, fromKey
         if toBucket
           new Upload
-            client: @s3
+            client: toS3.awsSdkS3
             params:
               Bucket: toBucket
               Key:    toKey
@@ -191,43 +240,129 @@ class S3 extends BaseClass
               .on :finish resolve
               .on :error  reject
 
+      else if streamCopy
+        @_streamCopy {}
+          fromBucket, fromKey
+          toBucket, toKey
+          toS3
+          size
+          sdkCopyOptions: @_getCommonCopyOptionsForSdk options
+          streamQueueSize: options.streamQueueSize
+
       else
-        @s3.copyObject copyOptions
+        toS3.s3.copyObject copyOptions
 
   delete: (options) ->
     @s3.deleteObject
       Bucket: options.bucket
       Key:    options.key
 
+  ## largeCopy
+    Server-side multipart copy: createMultipartUpload -> parallel uploadPartCopy
+    (byte-range per part, zero data through this machine) -> completeMultipartUpload.
+    All commands are sent to the destination-side client (toS3), so cross-region
+    copies land correctly. Replaces the old shell-out to 'aws s3 cp'.
+
+    Source metadata (ContentType, CacheControl, ...) is read via headObject and
+    carried over explicitly - matching what copyObject does automatically.
+
+    IN: options:
+      fromBucket, fromKey, toBucket, toKey: strings (or bucket/key defaults, see _normalizeCopyOptions)
+      size:                     <Number> REQUIRED - source object's byte size
+      toS3:                     <S3> destination-side instance (default: this)
+      sdkCopyOptions:           SDK-cased overrides (ACL, ContentType, StorageClass, ...)
+      largeCopyPartSize:        <Number> bytes/part [default 100MB; auto-raised to keep <= 10000 parts]
+      largeCopyPartConcurrency: <Number> concurrent uploadPartCopy calls per file [4]
+      pretend, verbose
   largeCopy: (options) ->
-    options extract commonCopyOptions
     @_normalizeCopyOptions(options) extract
-      fromBucket,
-      fromFolder, toBucket,
-      toFolder, fromKey,
-      toKey, pretend, verbose
+      fromBucket, fromKey
+      toBucket, toKey
+      pretend, verbose, size
 
-    command =
-      compactFlatten []
-        ""
-          aws s3 cp
-          #{} escape createS3Url fromBucket, fromFolder, fromKey
-          #{} escape createS3Url toBucket, toFolder, toKey
-        array v, key from commonCopyOptions when v
-          "" --#{dashCase key} #{}
-            switch v
-            when true then ''
-            else escape v
+    throw new Error "largeCopy requires options.size" unless size > 0
 
-      .join ' '
+    toS3            = options.toS3 ? this
+    sdkCopyOptions  = options.sdkCopyOptions ? @_getCommonCopyOptionsForSdk options
+    partConcurrency = options.largeCopyPartConcurrency ? 4
+    partSize        = Math.max
+      options.largeCopyPartSize ? 100 * 1024 ** 2
+      Math.ceil size / 10000 # S3 allows at most 10000 parts
+
+    parts = array i til Math.ceil size / partSize
+      {}
+        PartNumber:       i + 1
+        CopySourceRange:  "" bytes=#{i * partSize}-#{Math.min(size, (i + 1) * partSize) - 1}
 
     if verbose
-      log.unquoted largeCopy: command
+      log.unquoted largeCopy: {} fromBucket, fromKey, toBucket, toKey, size, partSize, parts: parts.length
 
     if pretend
-      timeout 1 -> pretend: true
-    else
-      shellExec command
+      return timeout 1 -> pretend: true
+
+    copySource = encodeURIComponent "" #{fromBucket}/#{fromKey}
+    partPwp = new PromiseWorkerPool partConcurrency
+
+    # copyObject preserves metadata automatically; multipart must carry it explicitly
+    @headObject bucket: fromBucket, key: fromKey
+    .then (head) =>
+      toS3.s3.createMultipartUpload merge
+        {} Bucket: toBucket, Key: toKey
+        object v, k from head when v? && k in preservedMetadataKeys
+        sdkCopyOptions
+
+    .then ({UploadId}) =>
+      Promise.all array {PartNumber, CopySourceRange} in-array parts
+        partPwp.queue ->
+          toS3.s3.uploadPartCopy {}
+            Bucket:     toBucket
+            Key:        toKey
+            UploadId
+            PartNumber
+            CopySource: copySource
+            CopySourceRange
+          .then ({CopyPartResult}) -> {} PartNumber, ETag: CopyPartResult.ETag
+
+      .then (completedParts) ->
+        toS3.s3.completeMultipartUpload
+          Bucket:           toBucket
+          Key:              toKey
+          UploadId:         UploadId
+          MultipartUpload:  Parts: completedParts
+
+      .catch (error) ->
+        # don't leave a half-finished multipart upload behind (they bill until aborted)
+        toS3.s3.abortMultipartUpload
+          Bucket:   toBucket
+          Key:      toKey
+          UploadId: UploadId
+        .catch -> null
+        .then -> throw error
+
+  ## _streamCopy
+    Cross-environment copy: every byte flows through this machine.
+    getObject on this (source-side) instance -> lib-storage Upload on toS3.
+    Upload handles multipart automatically; queueSize/partSize bound memory
+    (roughly queueSize * partSize per in-flight file).
+
+    Source metadata is carried from the getObject response; sdkCopyOptions
+    (user-provided ACL, ContentType, ...) override it.
+  _streamCopy: (options) ->
+    {fromBucket, fromKey, toBucket, toKey, toS3, size, sdkCopyOptions, streamQueueSize} = options
+
+    @s3.getObject {} Bucket: fromBucket, Key: fromKey
+    .then (source) ->
+      new Upload
+        client:    toS3.awsSdkS3
+        queueSize: streamQueueSize ? 4
+        partSize:  Math.max
+          16 * 1024 ** 2
+          Math.ceil (size ? 0) / 10000
+        params: merge
+          {} Bucket: toBucket, Key: toKey, Body: source.Body
+          object v, k from source when v? && k in preservedMetadataKeys
+          sdkCopyOptions
+      .done()
 
   # get object's metadata
   headObject: ({bucket, key}) ->

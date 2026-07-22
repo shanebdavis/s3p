@@ -1,7 +1,31 @@
 # Plan: Cross-Region & Cross-Account Copy Support
 
-Status: **proposed** (not started)
+Status: **Phases 0 & 3 implemented, Phase 4 partial** (branch `feature/compare-cross-env`, 2026-07); remaining: cross-account ACL warning, HeadBucket region auto-detect, large-scale real-AWS validation
+
+## Phase 4 (partial) — Stream-mode concurrency is memory-budgeted
+
+Server-side copying is request-bound (`copy-concurrency`/`large-copy-concurrency` bound request fan-out and only apply there). Streaming is memory- and bandwidth-bound, so stream mode uses ONE pool for all file sizes, sized by a memory budget: `--stream-memory` (default 512MB; each streaming file buffers up to 4×16MB = 64MB worst-case ⇒ 8 concurrent files) or `--stream-concurrency` directly. CLI help + README now document the copy-mode decision clearly, including that cross-account does NOT require streaming (shared principal via bucket policy keeps it server-side).
 Origin: customer report — "s3p couldn't reliably handle the cross-region, cross-account S3 transfer with the separate credentials and regional configuration required for our setup."
+
+## Phase 3 (DONE) — Real cross-environment copying, pure-JS multipart
+
+- The `aws s3 cp` shell-out is gone; aws-cli is no longer a dependency. `largeCopy` is server-side parallel multipart (`createMultipartUpload` → `uploadPartCopy` byte ranges via a per-file worker pool → `completeMultipartUpload`, abort on failure). Files > 5 GB now just work (multipart is forced above `copyObject`'s hard limit regardless of threshold).
+- Server-side copy commands are sent to the *destination* client (`toS3`) — fixes cross-region copy routing.
+- Distinct credentials/endpoints per side ⇒ automatic stream mode: `getObject` (from-side) → lib-storage multipart `Upload` (to-side). Override via `--copy-mode server|stream`.
+- Metadata (`ContentType`, `CacheControl`, custom `Metadata`, …) is preserved explicitly in both multipart and stream modes (`copyObject` did it automatically; these paths must carry it — verified by tests).
+- Fixed the pre-existing `Upload` bug (`client: @s3` → proper `S3Client`), so local→S3 uploads work.
+- Gotcha discovered: `art-standard-lib` exports its own `PromiseWorkerPool` whose `queue()` resolves with ALL results; `Lib/S3.caf` must explicitly require the local `Lib/PromiseWorkerPool`.
+- New advanced CLI options: `--large-copy-part-size`, `--large-copy-part-concurrency`, `--copy-mode`.
+
+## Phase 0 (DONE) — Cross-environment compare & pretend sync
+
+Shipped ahead of the copy work so discrepancies can be *detected* across environments today:
+
+- Per-side clients for listing: `fromS3`/`toS3` in `S3Comprehensions.each`; compare-listing now runs against the target's environment (and reuses one shared client when the sides match — previously `_compareList` constructed a fresh client per recursion step).
+- Config via SDK-native profiles: `S3` class accepts `profile` (S3Client config option, SDK ≥ 3.598 — no `@aws-sdk/credential-providers` dependency needed) and `credentials`. CLI: `--profile`, `--endpoint`, `--from-profile`/`--to-profile`, `--from-region`/`--to-region`, `--from-endpoint`/`--to-endpoint`.
+- Real cross-environment copying (any `to-profile`/`to-endpoint`/`to-credentials` without `--dryrun`) throws a clear not-yet-implemented error — Phase 3 removes that guard.
+- Fixed pre-existing bug: `normalizeOptions` dropped the `returning`/`into` aliases, so `compare` returned only listing stats instead of its counts/bytes discrepancy summary.
+- Test infra: second minio container (different port *and* credentials) in docker-compose; cross-env integration tests incl. real profile-file resolution. Run with `S3_ENDPOINT=http://localhost:9000 S3_ENDPOINT_B=http://localhost:9010 AWS_ACCESS_KEY_ID=testAccessKey AWS_SECRET_ACCESS_KEY=testSecretKey AWS_REGION=us-east-1 npm test`.
 
 ## Problem
 

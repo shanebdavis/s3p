@@ -61,8 +61,6 @@ exec = &util.promisify &child_process.exec
     if isString input
       input = input.trim()
 
-      log parseS3Url: {} input
-
       switch
       when match = input.match s3UrlPattern
         [_, bucket, prefix] = match

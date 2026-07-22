@@ -214,8 +214,10 @@ class S3P
       toBucket: <String> [Default: options.bucket] - target bucket
       toPrefix: <String> optional - prepend to key for toKey
       toKey: (optional) <Function> (fromKey, fromBucket, toBucket, size) -> to-key-string
-      copyConcurrency       [100]                   number of active copies < 1GB using aws sdk directly
-      largeCopyConcurrency  [copyConcurrency/4]     number of active copies > 1GB using exec aws cp
+      copyConcurrency       [100]                   server-side mode: number of active copies < largeCopyThreshold (single copyObject call each)
+      largeCopyConcurrency  [copyConcurrency/4]     server-side mode: number of active copies >= largeCopyThreshold (default 100MB; parallel server-side multipart uploadPartCopy)
+      streamMemory          [512MB]                 stream mode: local memory budget for streaming buffers; streamConcurrency derives from it
+      streamConcurrency     [streamMemory / 64MB]   stream mode: number of files actively streaming through this machine (one pool, all sizes)
       maxQueueSize          [copyConcurrency * 10]  max number of copy-jobs to queue before throttling s3.lists
   @copy: (options) =>
     @_copyWrapper options, (updatedOptions) =>
@@ -244,6 +246,8 @@ class S3P
       deleteConcurrency = 500
       deletePwp
       region, endpoint, useAccelerateEndpoint
+      profile
+      credentials
       maxSockets
       listConcurrency = 100
       s3
@@ -256,7 +260,7 @@ class S3P
 
     deletePwp ?= new PromiseWorkerPool deleteConcurrency
     maxSockets ?= deleteConcurrency + listConcurrency
-    s3 ?= new &Lib/S3 {} region, endpoint, useAccelerateEndpoint, maxSockets, verbose
+    s3 ?= new &Lib/S3 {} region, endpoint, useAccelerateEndpoint, profile, credentials, maxSockets, verbose
 
     stats ?= {}
     stats.deletedFiles = 0
@@ -391,8 +395,72 @@ class S3P
       endpoint
       maxSockets
       listConcurrency = 100
+      profile
+      fromProfile
+      fromRegion
+      fromEndpoint
+      fromCredentials
+      toProfile
+      toRegion
+      toEndpoint
+      toCredentials
+      toS3
+      copyMode
+      largeCopyPartSize
+      largeCopyPartConcurrency
+      streamQueueSize = 4
+      streamMemory = 512 * 1024 ** 2
+      streamConcurrency
     maxSockets ?= copyConcurrency + listConcurrency
-    s3 ?= new &Lib/S3 {} region, endpoint, useAccelerateEndpoint, maxSockets, verbose
+
+    s3 ?= new &Lib/S3 {}
+      region:       fromRegion ? region
+      endpoint:     fromEndpoint ? endpoint
+      profile:      fromProfile ? profile
+      credentials:  fromCredentials
+      useAccelerateEndpoint
+      maxSockets
+      verbose
+
+    # destination-side client: server-side copy commands must be sent to the
+    # destination's region/endpoint; shares the source client when config matches
+    toS3 ?=
+      if toProfile || toRegion || toEndpoint || toCredentials
+        new &Lib/S3 {}
+          region:       toRegion ? region
+          endpoint:     toEndpoint ? endpoint
+          profile:      toProfile ? profile
+          credentials:  toCredentials
+          useAccelerateEndpoint
+          maxSockets
+          verbose
+      else s3
+
+    ## copy-strategy selection: explicit and dumb
+      Different credentials or endpoints per side make server-side copy impossible
+      (one request = one signer), so those force stream mode: every byte flows
+      through this machine via getObject -> Upload.
+      A different region alone stays server-side: copy commands go to the
+      destination-region client (toS3) and reference the source via CopySource.
+      Override with copyMode: 'server' | 'stream' for odd cases.
+    streamCopy = switch copyMode
+      when :server then false
+      when :stream then true
+      else
+        (toProfile ? profile) != (fromProfile ? profile) ||
+        (toEndpoint ? endpoint) != (fromEndpoint ? endpoint) ||
+        toCredentials != fromCredentials
+
+    ## stream mode concurrency: memory is the real constraint
+      Server-side copies are cheap requests, so copyConcurrency/largeCopyConcurrency
+      bound request fan-out. A streaming file instead buffers up to
+      streamQueueSize * 16MB locally, so stream mode uses ONE pool whose size
+      derives from the streamMemory budget (or set streamConcurrency directly).
+    streamConcurrency ?= Math.max 1, Math.floor streamMemory / (streamQueueSize * 16 * 1024 ** 2)
+    streamPwp = new PromiseWorkerPool streamConcurrency
+
+    if streamCopy && verbose
+      log "s3p: cross-environment copy: streaming every byte through this machine (getObject -> multipart Upload), #{streamConcurrency} files at a time"
 
     stats ?= {}
     stats.copiedBytes = 0
@@ -405,16 +473,19 @@ class S3P
     throw new Error "toBucket or toFolder required" unless (present options.toBucket) || present options.toFolder
     eachFunction merge options, {}
       stats
-      throttle: -> copyPwp.queueSize + largeCopyPwp.queueSize >= maxQueueSize
+      throttle: -> copyPwp.queueSize + largeCopyPwp.queueSize + streamPwp.queueSize >= maxQueueSize
       getProgress: (duration) ->
         compactFlatten []
           "" copied
           "" #{} colors.green "" #{stats.copiedFiles}/#{stats.copyingFilesStarted} #{humanByteSize stats.copiedBytes}/#{humanByteSize stats.copyingBytesStarted}
           colors.blue "" #{humanByteSize stats.copiedBytesPerSecond = stats.copiedBytes / duration}/s
           "" inFlight: #{} colors.green humanByteSize stats.copyingBytesInFlight
-          "" copyWorkers: #{} colors.green "" #{copyPwp.activeWorkers} + #{largeCopyPwp.activeWorkers}
-          if 0 < copyPwp.queueSize + largeCopyPwp.queueSize
-            "" copyQueue: #{} colors.green "" #{copyPwp.queueSize} + #{largeCopyPwp.queueSize}
+          if streamCopy
+            "" streamWorkers: #{} colors.green "" #{streamPwp.activeWorkers}
+          else
+            "" copyWorkers: #{} colors.green "" #{copyPwp.activeWorkers} + #{largeCopyPwp.activeWorkers}
+          if 0 < copyPwp.queueSize + largeCopyPwp.queueSize + streamPwp.queueSize
+            "" copyQueue: #{} colors.green "" #{copyPwp.queueSize + largeCopyPwp.queueSize + streamPwp.queueSize}
           colors.yellow "PRETENDING" if pretend
         .join ' '
 
@@ -422,8 +493,11 @@ class S3P
         stats.copyingFilesStarted++
         stats.copyingBytesStarted += Size
 
-        if Size < largeCopyThreshold then copyPwp else largeCopyPwp
-        .queue ->
+        pool =
+          if streamCopy                     then streamPwp # stream mode: one memory-bounded pool, size is irrelevant
+          else if Size < largeCopyThreshold then copyPwp
+          else                                   largeCopyPwp
+        pool.queue ->
           stats.copyingBytesInFlight += Size
           options = merge
             s3.extractCommonCopyOptions options
@@ -437,6 +511,11 @@ class S3P
               toKey
               largeCopyThreshold
               size: Size
+              toS3
+              streamCopy
+              largeCopyPartSize
+              largeCopyPartConcurrency
+              streamQueueSize
 
           s3.copy options
           .then ->

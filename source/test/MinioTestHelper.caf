@@ -1,52 +1,64 @@
 import &StandardImport, &@aws-sdk/client-s3
 
 endpoint    = process.env.S3_ENDPOINT
+endpointB   = process.env.S3_ENDPOINT_B
 testBucket  = :s3p-test
 
-s3Client =
+credentials =
+  accessKeyId:      process.env.AWS_ACCESS_KEY_ID     ? :testAccessKey
+  secretAccessKey:  process.env.AWS_SECRET_ACCESS_KEY ? :testSecretKey
+
+# credentials for the second, independent test environment (see docker-compose.yml)
+credentialsB =
+  accessKeyId:      process.env.S3_B_ACCESS_KEY_ID     ? :testAccessKeyB
+  secretAccessKey:  process.env.S3_B_SECRET_ACCESS_KEY ? :testSecretKeyB
+
+makeTestClient = (endpoint, credentials) ->
   if endpoint
     new S3Client {}
       region:         :us-east-1
       endpoint
       forcePathStyle: true
-      credentials:
-        accessKeyId:      process.env.AWS_ACCESS_KEY_ID     ? :testAccessKey
-        secretAccessKey:  process.env.AWS_SECRET_ACCESS_KEY  ? :testSecretKey
+      credentials
+
+s3Client  = makeTestClient endpoint,  credentials
+s3ClientB = makeTestClient endpointB, credentialsB
 
 ## putTestObjects
-  IN: objects: array of {Key, Body} or just strings (used as both Key and Body)
+  IN:
+    objects: array of {Key, Body, ...anyOtherPutObjectOptions} or just strings (used as both Key and Body)
+    client: optional, defaults to the primary test environment's client
   OUT: Promise
-putTestObjects = (objects) ->
+putTestObjects = (objects, client = s3Client) ->
   Promise.all array obj in-array objects
-    {Key, Body} = if obj is String then Key: obj, Body: obj else obj
-    s3Client.send new PutObjectCommand
-      Bucket: testBucket
-      Key:    Key
-      Body:   Body
+    obj = if obj is String then Key: obj, Body: obj else obj
+    client.send new PutObjectCommand merge
+      {} Bucket: testBucket
+      obj
 
 ## deleteTestObjects
   IN: keys: array of strings
   OUT: Promise
-deleteTestObjects = (keys) ->
+deleteTestObjects = (keys, client = s3Client) ->
   Promise.all array Key in-array keys
-    s3Client.send new DeleteObjectCommand
+    client.send new DeleteObjectCommand
       Bucket: testBucket
       Key:    Key
 
 ## listBucketKeys
   IN: prefix: optional - only keys starting with prefix
   OUT: Promise<array of strings>
-listBucketKeys = (prefix) ->
-  s3Client.send new ListObjectsV2Command
+listBucketKeys = (prefix, client = s3Client) ->
+  client.send new ListObjectsV2Command
     Bucket: testBucket
     Prefix: prefix
   .then ({Contents}) -> array {Key} in-array (Contents ? []) with Key
 
 ## deleteAllBucketObjects
   Clean the entire test bucket. Use in afterAll when tests create dynamic keys.
-deleteAllBucketObjects = ->
-  listBucketKeys()
-  .then deleteTestObjects
+deleteAllBucketObjects = (client = s3Client) ->
+  listBucketKeys undefined, client
+  .then (keys) -> deleteTestObjects keys, client
 
 ## setupTestScenario
   Sets up a describe block with beforeAll/afterAll that creates and cleans up test objects.
@@ -54,22 +66,65 @@ deleteAllBucketObjects = ->
     name: string - describe block name
     keys: array of strings - keys to create (body = key string)
     fn: (testOptions) -> define tests inside this function
-  testOptions: {endpoint, testBucket}
+  testOptions: {endpoint, testBucket, s3Client}
 setupTestScenario = (name, keys, fn) ->
   if endpoint
     describe name, ->
       beforeAll -> putTestObjects keys
       afterAll  -> deleteAllBucketObjects()
-      fn {} endpoint, testBucket
+      fn {} endpoint, testBucket, s3Client
   else
     test "#{name} skipped (no S3_ENDPOINT)" ->
 
+## setupCrossEnvTestScenario
+  Like setupTestScenario, but seeds TWO independent environments
+  (different endpoints AND different credentials).
+  IN:
+    name: string - describe block name
+    keysA: array of {Key, Body} or strings - seeded into the primary environment
+    keysB: array of {Key, Body} or strings - seeded into the secondary environment
+    fn: (testOptions) -> define tests inside this function
+  testOptions: {endpoint, endpointB, testBucket, credentials, credentialsB, s3Client, s3ClientB}
+setupCrossEnvTestScenario = (name, keysA, keysB, fn) ->
+  # clean any leftovers from a crashed prior run before seeding: exact-key
+  # assertions in the tests depend on a pristine starting state
+  seededPrefixes = uniqueValues array obj in-array compactFlatten [] keysA, keysB
+    key = if obj is String then obj else obj.Key
+    key.split('/')[0] + '/'
+
+  cleanSeededPrefixes = (client) ->
+    Promise.all array prefix in-array seededPrefixes
+      listBucketKeys prefix, client
+      .then (keys) -> deleteTestObjects keys, client
+
+  if endpoint && endpointB
+    describe name, ->
+      beforeAll ->
+        Promise.all []
+          cleanSeededPrefixes s3Client
+          cleanSeededPrefixes s3ClientB
+        .then ->
+          Promise.all []
+            putTestObjects keysA
+            putTestObjects keysB, s3ClientB
+      afterAll ->
+        Promise.all []
+          deleteAllBucketObjects()
+          deleteAllBucketObjects s3ClientB
+      fn {} endpoint, endpointB, testBucket, credentials, credentialsB, s3Client, s3ClientB
+  else
+    test "#{name} skipped (set S3_ENDPOINT and S3_ENDPOINT_B to run)" ->
+
 {}
   endpoint
+  endpointB
   testBucket
+  credentials
+  credentialsB
   s3Client
   putTestObjects
   deleteTestObjects
   listBucketKeys
   deleteAllBucketObjects
   setupTestScenario
+  setupCrossEnvTestScenario

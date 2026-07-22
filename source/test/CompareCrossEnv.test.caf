@@ -1,0 +1,224 @@
+import &StandardImport, &MinioTestHelper
+
+fs    = &fs
+os    = &os
+path  = &path
+
+# selective import: &@aws-sdk/client-s3 exports a class named S3 that would shadow s3p's S3
+{GetObjectCommand, HeadObjectCommand} = &@aws-sdk/client-s3
+
+##
+  Cross-environment integration tests: two independent MinIO instances with
+  DIFFERENT endpoints and DIFFERENT credentials (see docker-compose.yml).
+  Enable with: S3_ENDPOINT=http://localhost:9000 S3_ENDPOINT_B=http://localhost:9010
+
+  Target-side credentials are resolved through a real AWS profile written to a
+  temp credentials file - proving the --to-profile path end-to-end.
+
+profileName = "s3p-test-env-b"
+
+# all keys live under their own prefix: jest runs suites in parallel and they
+# share the test bucket, so every assertion below is scoped to testPrefix
+testPrefix = "cross-env/"
+
+keysA = []
+  {} Key: "cross-env/same.txt",      Body: "same-content"
+  {} Key: "cross-env/replace.txt",   Body: "0123456789"
+  {} Key: "cross-env/only-in-a.txt", Body: "a"
+
+keysB = []
+  {} Key: "cross-env/same.txt",      Body: "same-content"
+  {} Key: "cross-env/replace.txt",   Body: "01234"
+  {} Key: "cross-env/only-in-b.txt", Body: "b"
+
+setupCrossEnvTestScenario "CompareCrossEnv", keysA, keysB, ({endpoint, endpointB, testBucket, credentialsB, s3ClientB}) ->
+
+  credentialsFilePath = path.join os.tmpdir(), "s3p-test-aws-credentials"
+  savedSharedCredentialsFile = undefined
+
+  beforeAll ->
+    fs.writeFileSync
+      credentialsFilePath
+      """
+        [#{profileName}]
+        aws_access_key_id = #{credentialsB.accessKeyId}
+        aws_secret_access_key = #{credentialsB.secretAccessKey}
+
+    savedSharedCredentialsFile = process.env.AWS_SHARED_CREDENTIALS_FILE
+    process.env.AWS_SHARED_CREDENTIALS_FILE = credentialsFilePath
+
+  afterAll ->
+    if savedSharedCredentialsFile?
+      process.env.AWS_SHARED_CREDENTIALS_FILE = savedSharedCredentialsFile
+    else
+      delete process.env.AWS_SHARED_CREDENTIALS_FILE
+
+  test "compare detects all discrepancies across two environments via to-profile" ->
+    S3P.compare
+      bucket:     testBucket
+      toBucket:   testBucket
+      prefix:     testPrefix
+      quiet:      true
+      toEndpoint: endpointB
+      toProfile:  profileName
+
+    .then ({counts}) ->
+      assert.eq counts.same,          1
+      assert.eq counts.needToCopy,    1  # only-in-a.txt
+      assert.eq counts.needToDelete,  1  # only-in-b.txt
+      assert.eq counts.needToReplace, 1  # replace.txt (sizes differ)
+
+  test "compare works with directly-provided toCredentials (programmatic API)" ->
+    S3P.compare
+      bucket:         testBucket
+      toBucket:       testBucket
+      prefix:         testPrefix
+      quiet:          true
+      toEndpoint:     endpointB
+      toCredentials:  credentialsB
+
+    .then ({counts}) ->
+      assert.eq counts.same,          1
+      assert.eq counts.needToCopy,    1
+      assert.eq counts.needToDelete,  1
+      assert.eq counts.needToReplace, 1
+
+  test "compare fails without target-side credentials - proving credential separation is real" ->
+    S3P.compare
+      bucket:     testBucket
+      toBucket:   testBucket
+      prefix:     testPrefix
+      quiet:      true
+      toEndpoint: endpointB
+
+    .then -> throw new Error "expected compare to fail with source credentials against target endpoint"
+    .catch (error) ->
+      assert.eq true, /InvalidAccessKeyId|SignatureDoesNotMatch|AccessDenied|Forbidden/.test("#{error}"), "" unexpected error: #{error}
+
+  test "pretend sync reports all discrepancies without modifying the target" ->
+    S3P.sync
+      bucket:     testBucket
+      toBucket:   testBucket
+      prefix:     testPrefix
+      quiet:      true
+      dryrun:     true
+      toEndpoint: endpointB
+      toProfile:  profileName
+
+    .then ({finalStats}) ->
+      assert.eq finalStats.copiedFiles,    1  # only-in-a.txt would be copied
+      assert.eq finalStats.toReplaceFiles, 1  # replace.txt differs (no overwrite)
+      assert.eq finalStats.toDeleteFiles,  1  # only-in-b.txt is extra in target
+      assert.eq finalStats.unchangedFiles, 1  # same.txt
+
+      # verify nothing was actually copied or deleted in the target
+      listBucketKeys testPrefix, s3ClientB
+      .then (keys) ->
+        assert.eq keys.slice().sort(), ["cross-env/only-in-b.txt", "cross-env/replace.txt", "cross-env/same.txt"]
+
+  test "listBuckets respects environment options (profile + endpoint)" ->
+    listBuckets
+      endpoint: endpointB
+      profile:  profileName
+
+    .then (buckets) ->
+      assert.eq true, buckets[testBucket]?, "" expected bucket #{testBucket} in #{JSON.stringify buckets}
+
+  test "real cross-environment sync streams missing + changed files to the target" ->
+    S3P.sync
+      bucket:     testBucket
+      toBucket:   testBucket
+      prefix:     testPrefix
+      overwrite:  true
+      quiet:      true
+      toEndpoint: endpointB
+      toProfile:  profileName
+
+    .then ({finalStats}) ->
+      assert.eq finalStats.copiedFiles, 2 # only-in-a.txt + replace.txt (overwrite)
+
+      Promise.all []
+        s3ClientB.send new GetObjectCommand Bucket: testBucket, Key: "cross-env/only-in-a.txt"
+        .then (r) -> r.Body.transformToString()
+
+        s3ClientB.send new GetObjectCommand Bucket: testBucket, Key: "cross-env/replace.txt"
+        .then (r) -> r.Body.transformToString()
+
+    .then ([onlyInA, replaced]) ->
+      assert.eq onlyInA,  "a"
+      assert.eq replaced, "0123456789"
+
+      # target is now in sync: a second sync copies nothing
+      S3P.sync
+        bucket:     testBucket
+        toBucket:   testBucket
+        prefix:     testPrefix
+        quiet:      true
+        toEndpoint: endpointB
+        toProfile:  profileName
+
+    .then ({finalStats}) ->
+      assert.eq finalStats.copiedFiles,    0
+      assert.eq finalStats.unchangedFiles, 3
+
+  test "stream copy preserves metadata (ContentType + custom Metadata)" ->
+    putTestObjects []
+      {} Key: "cross-env-meta/styled.css", Body: "body{}", ContentType: "text/css", Metadata: source: "env-a"
+
+    .then ->
+      S3P.copy
+        bucket:     testBucket
+        toBucket:   testBucket
+        prefix:     "cross-env-meta/"
+        quiet:      true
+        toEndpoint: endpointB
+        toProfile:  profileName
+
+    .then ->
+      s3ClientB.send new HeadObjectCommand Bucket: testBucket, Key: "cross-env-meta/styled.css"
+
+    .then (head) ->
+      assert.eq head.ContentType,     "text/css"
+      assert.eq head.Metadata.source, "env-a"
+      assert.eq head.ContentLength,   6
+
+  test "large files stream cross-environment (routed through the large-copy pool)" ->
+    size = 12 * 1024 ** 2
+    putTestObjects []
+      {} Key: "cross-env-large/big.bin", Body: Buffer.alloc size, "y"
+
+    .then ->
+      S3P.copy
+        bucket:             testBucket
+        toBucket:           testBucket
+        prefix:             "cross-env-large/"
+        quiet:              true
+        toEndpoint:         endpointB
+        toProfile:          profileName
+        largeCopyThreshold: 5 * 1024 ** 2
+
+    .then ->
+      s3ClientB.send new HeadObjectCommand Bucket: testBucket, Key: "cross-env-large/big.bin"
+
+    .then (head) ->
+      assert.eq head.ContentLength, size
+
+describe
+  crossEnvironmentClientConfig: ->
+    test "S3 constructor: profile suppresses ambient S3_ENDPOINT env var" ->
+      savedEndpoint = process.env.S3_ENDPOINT
+      process.env.S3_ENDPOINT = "http://ambient-endpoint.example:9999"
+      try
+        withProfile    = new S3 profile: "any-profile"
+        withoutProfile = new S3()
+        assert.eq undefined, withProfile.awsSdkS3.config.endpoint
+        assert.eq true, withoutProfile.awsSdkS3.config.endpoint?, "expected ambient S3_ENDPOINT to apply when no profile is set"
+      finally
+        if savedEndpoint?
+          process.env.S3_ENDPOINT = savedEndpoint
+        else
+          delete process.env.S3_ENDPOINT
+
+    test "S3 constructor: explicit endpoint still wins over profile" ->
+      s3 = new S3 profile: "any-profile", endpoint: "http://explicit.example:9000"
+      assert.eq true, s3.awsSdkS3.config.endpoint?

@@ -81,7 +81,7 @@ class S3Comprehensions
         filter
         map
         mapList
-        returnValue
+        returnValue: returnValue ? returningV
         startAfter
         stopAt
         copyConcurrency
@@ -264,13 +264,46 @@ class S3Comprehensions
       endpoint
       maxSockets
       verbose
+      profile
+
+      # per-side overrides for cross-environment operations
+      fromProfile
+      fromRegion
+      fromEndpoint
+      fromCredentials
+      toProfile
+      toRegion
+      toEndpoint
+      toCredentials
 
       # internal use only
       s3
+      toS3
       pwp = new PromiseWorkerPool listConcurrency # internal use only
 
     maxSockets ?= listConcurrency
-    s3 ?= new &Lib/S3 {} region, endpoint, maxSockets, verbose, useAccelerateEndpoint: !!useAccelerateEndpoint
+    s3 ?= new &Lib/S3 {}
+      region:       fromRegion ? region
+      endpoint:     fromEndpoint ? endpoint
+      profile:      fromProfile ? profile
+      credentials:  fromCredentials
+      maxSockets
+      verbose
+      useAccelerateEndpoint: !!useAccelerateEndpoint
+
+    # compare-listing (toBucket) runs against the target's environment; it shares
+    # the source client unless target-side options require a different one
+    toS3 ?=
+      if toProfile || toRegion || toEndpoint || toCredentials
+        new &Lib/S3 {}
+          region:       toRegion ? region
+          endpoint:     toEndpoint ? endpoint
+          profile:      toProfile ? profile
+          credentials:  toCredentials
+          maxSockets
+          verbose
+          useAccelerateEndpoint: !!useAccelerateEndpoint
+      else s3
 
     if compare && map && toBucket
       throw new Error "cannot use both `compare` and `map` - use mapList instead"
@@ -406,12 +439,14 @@ class S3Comprehensions
 
           compare && toBucket && @_compareList leftCompareOptions = {}
             limit, pwp
+            s3: toS3
             startAfter: toKey startAfter
             bucket: toBucket
             stopAt: toKey if leftItems.length == limit then peek(leftItems).Key else middleKey
 
           compare && toBucket && @_compareList rightCompareOptions = {}
             limit, pwp
+            s3: toS3
             bucket: toBucket
             startAfter: toKey middleKey
             stopAt: toKey if rightItems.length == limit then peek(rightItems).Key else stopAt

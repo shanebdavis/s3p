@@ -21,13 +21,10 @@ Read more about [S3P on Medium](https://medium.com/@shanebdavis/s3p-massively-pa
 # Requirements
 
 1. [NodeJS](https://nodejs.org/en/download/)
-2. [AWS-CLI](https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-install.html)
 
-   The `aws-cli` is required for copying large files. By default, files larger than 100 megabytes are copied with `aws-cli`. This is a good compromise for performance. However, you can change that threshold to 5 gigabytes with the `--large-copy-threshold` option.
+   > The `aws-cli` is no longer required. Large files (>= 100 megabytes by default, see `--large-copy-threshold`) are now copied with server-side parallel multipart copy (`s3.uploadPartCopy`) - pure JavaScript, no data flows through your machine, and files larger than 5 gigabytes (s3.copyObject's hard limit) just work.
 
-   > Why? The `aws-sdk` does not support coping files larger than 5 gigabytes without a much more complicated solution.
-
-3. Key names must use a limited character set:
+2. Key names must use a limited character set:
    ```
    <space>
    !"#$%&'()*+,-./
@@ -40,6 +37,40 @@ Read more about [S3P on Medium](https://medium.com/@shanebdavis/s3p-massively-pa
 # AWS Credentials
 
 s3p uses the same credentials aws-cli uses, so see their documentation: https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-configure.html
+
+You can also select a specific AWS profile with `--profile`, exactly like the aws-cli. The profile's credentials, region and endpoint_url are all respected, with standard AWS precedence (explicit options override environment variables, which override the profile's settings).
+
+# Cross-Environment Compare, Sync & Copy
+
+> ⚠️ **New feature - cross-environment COPYING is under-tested.** Cross-account `compare` and `sync --dryrun` (listing and diffing two buckets with two credential sets) have been tested against real AWS accounts and work great. Actual cross-account *copying* - especially stream mode - has so far only been verified against local MinIO test environments, not real AWS. Before trusting it with important data: run `sync --dryrun` first, try a small prefix, and verify the results (sizes, metadata) on the target. Feedback welcome!
+
+`compare`, `sync` and `cp` work across two completely separate environments - different AWS accounts, regions, or even S3-compatible services like MinIO. Each side gets its own client, configured the AWS-standard way: with profiles.
+
+```shell
+# ~/.aws/config
+# [profile staging]     [profile production]
+# region = us-west-2    region = us-east-1
+
+# compare the same bucket name across two accounts
+npx s3p compare --bucket my-bucket --to-bucket my-bucket \
+  --from-profile staging --to-profile production
+
+# pretend-sync: detect and report every discrepancy without copying anything
+npx s3p sync --bucket my-bucket --to-bucket my-bucket \
+  --from-profile staging --to-profile production --dryrun
+
+# real sync across two accounts
+npx s3p sync --bucket my-bucket --to-bucket my-bucket \
+  --from-profile staging --to-profile production
+```
+
+Per-side options: `--from-profile`/`--to-profile`, `--from-region`/`--to-region` and `--from-endpoint`/`--to-endpoint`. Any side without per-side options uses your ambient environment (env vars or `--profile`), so typically you only need to add one flag for the "other" side. The programmatic API additionally accepts `fromCredentials`/`toCredentials` (any AWS SDK v3 credentials object or provider).
+
+How copying works across environments: when both sides share credentials and endpoint, copies are server-side (`s3.copyObject`, or parallel multipart `s3.uploadPartCopy` for large files) - **zero bytes flow through your machine**, even cross-region, so s3p remains pure orchestration you can run from home broadband. When the sides have *different* credentials or endpoints, server-side copy is impossible (one request = one signer), so s3p automatically streams each file through your machine: `getObject` from the source, multipart upload to the target, preserving `ContentType`, `CacheControl`, custom metadata, etc. Force a specific strategy with `--copy-mode server|stream`.
+
+**Cross-account does NOT require streaming.** If one principal can read the source and write the destination - typically the source account grants your destination-account user read access with a bucket policy - then use plain `--profile` with that principal and copies stay server-side, entirely in-cloud. Reserve two-profile stream mode for when the accounts truly cannot share a principal.
+
+Stream mode notes: your machine's bandwidth is the bottleneck - for big transfers, run s3p on an EC2 instance in one of the two regions. Concurrency is bounded by local memory, not request count: each actively-streaming file buffers up to 64MB, and `--stream-memory` (default 512MB, allowing 8 concurrent files) or `--stream-concurrency` control the commitment. Streaming lots of small files? Raise them.
 
 # CLI
 
@@ -81,7 +112,7 @@ In addition to performance, S3P provides flexible options for custom list, copyi
 
 # Performance
 
-Surprisingly, you don't even need to run S3P in the cloud to see much of its benefits. You can run it on your local machine and, since S3 copying never goes directly through S3P, it doesn't use up any AWS bandwidth.
+Surprisingly, you don't even need to run S3P in the cloud to see much of its benefits. You can run it on your local machine and, since server-side S3 copying never goes directly through S3P, it doesn't use up any of your bandwidth. (The one exception: cross-environment stream mode, where two credential sets make server-side copy impossible - see "Cross-Environment Compare, Sync & Copy" above.)
 
 S3-bucket-listing performance can hit almost ~~20,000~~ 50,000 items per second (as-of S3Pv3.5).
 
@@ -115,7 +146,50 @@ npx s3p cp --help
 
 # API
 
-All the capabilities of the CLI are also available as an API. To learn the API, first learn the CLI options, and then, to learn the API call for a specific CLI command, run that command on the command-line with the `--api-example` option. This will output example JavaScript code for invoking that command programmatically.
+All the capabilities of the CLI are also available as an API - every command is an exported async function:
+
+```javascript
+const s3p = require("s3p");
+```
+
+## Exported Functions
+
+Each returns a Promise. Options are the lowerCamelCase equivalents of the CLI options (`--to-bucket` → `toBucket`, `--from-profile` → `fromProfile`, ...).
+
+| function                | description                                                                                                             |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `ls(options)`           | list matching keys; resolves to an array of key strings (or full items with `raw: true`)                                |
+| `listBuckets(options)`  | resolves to a map of bucket names to creation dates                                                                      |
+| `summarize(options)`    | scan a bucket and resolve to size/count statistics, size histograms, and optional per-folder or custom `groupBy` totals |
+| `compare(options)`      | diff two buckets (any two environments); resolves to `{counts, bytes}` - same, needToCopy, needToReplace, needToDelete  |
+| `cp(options)`           | copy everything from one bucket/folder to another; resolves to `{finalStats}`                                            |
+| `sync(options)`         | copy only what's missing or different (see the sync CLI help for the exact rules); resolves to `{finalStats}`           |
+| `delete(options)`       | delete matching keys (requires `confirmDeleteItemsFromBucket`); resolves to `{finalStats}`                               |
+| `each(options)`         | custom iteration: your `map`/`mapList` function is called for every matching item                                        |
+| `map(options)`          | map-reduce over all matching items with `map`, `reduce`, and optional `finally` functions                                |
+| `version`               | s3p's version string (a property, not a function)                                                                        |
+
+API-only options, in addition to everything the CLI accepts:
+
+- `fromCredentials` / `toCredentials`: any AWS SDK v3 credentials object or provider, per side - an alternative to `fromProfile`/`toProfile` for cross-environment operations
+- `credentials`: same, applied to both sides
+- `filter`, `toKey`, `map`, `mapList`, `reduce`, `finally`: plain JavaScript functions (the CLI takes `js:`-prefixed strings)
+
+Example - compare two accounts programmatically:
+
+```javascript
+const { counts, bytes } = await s3p.compare({
+  bucket: "my-bucket",
+  toBucket: "my-bucket",
+  fromProfile: "staging",
+  toProfile: "production",
+  quiet: true,
+});
+```
+
+## Learning API Options via the CLI
+
+To learn the API call for a specific CLI command, run that command on the command-line with the `--api-example` option. This will output example JavaScript code for invoking that command programmatically.
 
 > NOTE: When you use `--api-example` on the command-line, your command won't actually run. S3P will _only_ output the JavaScript equivalent of the CLI command to the console and then quit.
 

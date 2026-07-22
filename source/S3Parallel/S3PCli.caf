@@ -10,7 +10,12 @@ standardFromToArgs =
   argument:     "[from [to]]"
   argsToOptions: processArgsIntoOptions
 
-allCommandOptions =
+environmentOptions =
+  region:       "" The AWS region of the bucket. Will use AWS_REGION environment variable if not specified.
+  profile:      "" The AWS profile to use (from ~/.aws/config and ~/.aws/credentials). Overrides the AWS_PROFILE environment variable. The profile's credentials, region and endpoint_url are all respected (standard AWS precedence applies). When set, the S3_ENDPOINT environment variable is ignored.
+  endpoint:     "" Custom S3 endpoint URL, e.g. for MinIO or other S3-compatible stores. Will use S3_ENDPOINT environment variable if not specified. Implies path-style addressing.
+
+allCommandOptions = merge environmentOptions,
   quiet:                      "" no output
   verbose:                    "" extra output
   api-example:                advanced: true description: "" Output an example of how to invoke the S3P API. Start by constructing the S3P command you want to use with the appropriate command-line options. Then append this option and execute the command. Instead of doing the actual S3P command, S3P will output the JavaScript for invoking this command using the S3P API.
@@ -22,7 +27,6 @@ allCommandOptions =
   start-after:  :key          "" Start iteratating after this key. If 'prefix' is also specified, the set-intersection of the two will be used.
   stop-at:      :key          "" Iterate up to, and including, this key. If 'prefix' is also specified, the set-intersection of the two will be used.
   fetch-owner:  "" If you want to filter on the Owner property of items, you'll need to add this option to fetch that property. Note: this adds about 10% overhead for listing items.
-  region:       "" The AWS region of the bucket. Will use AWS_REGION environment variable if not specified.
 
   pattern:
     "" string OR js:/^any-javascript-regexp/i
@@ -90,21 +94,49 @@ toFolderOptions = # to-bucket copied here to REMOVE the required, since one
   to-bucket:    :bucket-name        "" The target bucket. It can be the same bucket. (to-bucket OR to-folder required)
   to-folder:    :to-folder          "" Path to a folder in the local file system. (to-bucket OR to-folder required)
 
+crossEnvironmentOptions =
+  from-profile:   :profile-name "" AWS profile for the SOURCE side only. Default: --profile. Profiles are the standard way to give s3p two different credential sets - one per side. IMPORTANT: two different profiles force STREAM mode - every byte flows through this machine. Cross-ACCOUNT copies do NOT require two profiles; see --to-profile.
+  to-profile:
+    :profile-name
+    ""
+      AWS profile for the TARGET side only. Default: --profile.
+
+      IMPORTANT: setting per-side profiles forces STREAM mode - every byte flows through this machine, and your bandwidth + --stream-memory become the limits.
+
+      Cross-ACCOUNT copies do NOT require two profiles. If ONE principal can read the source and write the destination (e.g. the source account grants your user access with a bucket policy), use plain --profile with that principal instead: copies stay server-side, entirely in-cloud, and s3p is pure orchestration - fine to run over home broadband. Only use two profiles when the two sides truly cannot share a principal.
+  from-region:    :region       "" AWS region for the SOURCE side only. Default: --region. A region difference alone does NOT force stream mode - cross-region copies stay server-side.
+  to-region:      :region       "" AWS region for the TARGET side only. Default: --region. A region difference alone does NOT force stream mode - cross-region copies stay server-side.
+  from-endpoint:  :url          "" Custom S3 endpoint for the SOURCE side only. Default: --endpoint. Different endpoints per side force STREAM mode (see --to-profile).
+  to-endpoint:    :url          "" Custom S3 endpoint for the TARGET side only. Default: --endpoint. Different endpoints per side force STREAM mode (see --to-profile).
+
 advancedOptionsForAll =
   list-concurrency:        advanced: true argument: :100     description: ""Maximum number of simultaneous list operations
   max-list-requests:       advanced: true argument: :number  description: "" Not set by default; If set, will stop when hit. Use to limit how many requests get used.
   max-sockets:             advanced: true argument: :number  description: "" Maximum concurrent HTTP connections to S3. Defaults to match the operation's concurrency options: list-concurrency for list-only commands, copy-concurrency + list-concurrency for copy/sync, delete-concurrency + list-concurrency for delete.
 
 advancedOptionsForCopy = merge advancedOptionsForAll,
-  copy-concurrency:        advanced: true argument: :500       description: "" Maximum number of simultaneous small-copies
-  large-copy-concurrency:  advanced: true argument: :75        description: "" Maximum number of simultaneous large-copies
+  copy-concurrency:        advanced: true argument: :500       description: "" SERVER-SIDE copy mode only: maximum number of simultaneous small-copies (single copyObject calls). Stream mode ignores this - see --stream-concurrency.
+  large-copy-concurrency:  advanced: true argument: :75        description: "" SERVER-SIDE copy mode only: maximum number of simultaneous large-copies (parallel multipart uploadPartCopy). Server-side copies are cheap requests, so this bounds request fan-out, not memory. Stream mode ignores this - see --stream-concurrency.
+  stream-concurrency:      advanced: true argument: :number    description: "" STREAM mode only: number of files actively streaming through this machine at once. Default: derived from --stream-memory. Streaming many small files? Raise this (or --stream-memory) - the default is sized for worst-case large files.
+  stream-memory:           advanced: true argument: :536870912 description: "" STREAM mode only: approximate local memory budget for streaming buffers. Each actively-streaming file buffers up to 4 parts of 16MB (64MB worst-case), so the default 512MB allows 8 concurrent files. Ignored when --stream-concurrency is set explicitly.
   max-queue-size:          advanced: true argument: :50000     description: "" Maximum number of files that can be queued for copying before list-reading is throttled.
   large-copy-threshold:    advanced: true argument: :104857600 description:
     ""
-      Files larger than this byte-size will use the large-copy strategy, which is currently a
-      shell-exec of 'aws s3 cp'. Currently this must be set <= 5368709120 (5 gigabytes).
-      This is s3.copyObject's max supported size, so S3P must shell-exec aws-cli for larger files.
+      Files at or above this byte-size use the large-copy strategy: server-side parallel
+      multipart copy (s3.uploadPartCopy - no data flows through this machine). Smaller files
+      use a single s3.copyObject call. Since s3.copyObject hard-fails above 5368709120
+      (5 gigabytes), files that big always use multipart regardless of this setting.
       100 megabytes, the default, has been tested to be a good selection for maximum performance.
+  large-copy-part-size:        advanced: true argument: :104857600 description: "" Byte-size of each server-side multipart-copy part. Auto-raised when needed to keep a file under S3's 10000-part limit.
+  large-copy-part-concurrency: advanced: true argument: :4         description: "" Simultaneous uploadPartCopy calls per large file.
+  copy-mode:                   advanced: true argument: :auto      description:
+    ""
+      auto (default): server-side copy when both sides share credentials and endpoint; otherwise
+      stream mode - every byte flows through this machine via getObject -> multipart upload
+      (required when the two sides use different credentials, since one request has one signer).
+      server: force server-side copy. stream: force stream mode.
+      TIP: to copy cross-account WITHOUT streaming, use one principal that can access both
+      buckets (bucket policy) with plain --profile - see --to-profile for details.
 
 cliCommands =
   version:
@@ -112,6 +144,7 @@ cliCommands =
 
   list-buckets:
     description:  "" List all your S3 buckets.
+    options:      environmentOptions
 
   ls:
     description:  "" List all matching files. Uses s3.listObjectsV2.
@@ -141,12 +174,15 @@ cliCommands =
       "" get item/size totals grouped by the first path segment
 
   compare:
-    description:  "" Compare two buckets and produce a summary of their differences. Uses s3.listObjectsV2.
-    options:      merge allCommandOptions, toBucketOptions, advancedOptionsForAll
+    description:  "" Compare two buckets and produce a summary of their differences. The two buckets can live in different regions, accounts or even S3-compatible services - see the from/to options. Uses s3.listObjectsV2.
+    options:      merge allCommandOptions, toBucketOptions, crossEnvironmentOptions, advancedOptionsForAll
     args:         standardFromToArgs
     examples:
       bucket: :my-bucket to-bucket: :my-to-bucket
       "" Compare items from my-bucket with my-to-bucket. Shows how many items exist in both, only one, or are difference sizes.
+
+      bucket: :my-bucket to-bucket: :my-bucket from-profile: :staging to-profile: :production
+      "" Compare the same bucket name across two AWS accounts, using two profiles from ~/.aws/config.
 
   cp:
     description:
@@ -154,7 +190,13 @@ cliCommands =
         Copy all files from one bucket to another bucket. Uses s3.listObjectsV2, s3.copyObject and shell-exec 'aws s3 cp'.
 
         NOTE: This overwrites existing files in the target bucket. Try the 'sync' command for smarter copies when some of the files have already been copied.
-    options:      merge allCommandOptions, toBucketOptions, writeOptions, advancedOptionsForCopy, toFolderOptions
+
+        Two copy modes (see --copy-mode):
+
+        SERVER-SIDE (default whenever both sides share one set of credentials and one endpoint): s3.copyObject, or parallel multipart s3.uploadPartCopy for large files. ZERO bytes flow through this machine - s3p is pure orchestration, so even huge in-cloud moves (including cross-REGION and cross-ACCOUNT via a shared principal + bucket policy) run fine from home broadband.
+
+        STREAM (automatic when the two sides use DIFFERENT credentials or endpoints, e.g. --to-profile/--to-endpoint): server-side copy is impossible (one request = one signer), so every byte flows through this machine: getObject -> multipart upload. Your bandwidth and --stream-memory are the limits; for big transfers run s3p near one of the buckets. Before reaching for stream mode, check whether one principal could access both buckets - see --to-profile.
+    options:      merge allCommandOptions, toBucketOptions, crossEnvironmentOptions, writeOptions, advancedOptionsForCopy, toFolderOptions
     args:         standardFromToArgs
     examples:
       bucket: :my-bucket to-bucket: :my-to-bucket
@@ -185,14 +227,35 @@ cliCommands =
       "" Copy everything from my-bucket to my-to-bucket with the prefix "2020-04-14/" with an owner's ID is 'abc123'.
 
   sync:
-    description:  "" Only copy files which do not exist in the target bucket. Uses s3.listObjectsV2, s3.copyObject and shell-exec 'aws s3 cp'.
-    options:      merge allCommandOptions, toBucketOptions, writeOptions, advancedOptionsForCopy,
+    description:
+      """
+        Copy only what's missing or different. Both buckets are listed in parallel and diffed by key, comparing byte-SIZE ONLY (no timestamps, no checksums, no content):
+
+          - key missing in target:               copied
+          - key in both, sizes differ:           copied only with --overwrite, otherwise just reported
+          - key in target only:                  never deleted - a suggested 'aws s3 rm' is logged for you to run
+          - key in both, same size:              skipped, even if the contents differ
+
+        Use --dryrun to see exactly what would happen without copying anything.
+
+        Two copy modes (see --copy-mode):
+
+        SERVER-SIDE (default whenever both sides share one set of credentials and one endpoint): s3.copyObject, or parallel multipart s3.uploadPartCopy for large files. ZERO bytes flow through this machine - s3p is pure orchestration, so even huge in-cloud moves (including cross-REGION and cross-ACCOUNT via a shared principal + bucket policy) run fine from home broadband.
+
+        STREAM (automatic when the two sides use DIFFERENT credentials or endpoints, e.g. --to-profile/--to-endpoint): server-side copy is impossible (one request = one signer), so every byte flows through this machine: getObject -> multipart upload. Your bandwidth and --stream-memory are the limits; for big transfers run s3p near one of the buckets. Before reaching for stream mode, check whether one principal could access both buckets - see --to-profile.
+    options:      merge allCommandOptions, toBucketOptions, crossEnvironmentOptions, writeOptions, advancedOptionsForCopy,
                   overwrite: "" If set, sync will overwrite existing files with different file sizes.
     args:         standardFromToArgs
 
     examples:
       bucket: :my-bucket to-bucket: :my-to-bucket
       "" Copy everything from my-bucket to my-to-bucket
+
+      bucket: :my-bucket to-bucket: :my-bucket from-profile: :staging to-profile: :production dryrun: true
+      "" Pretend-sync across two AWS accounts: detect and report every discrepancy without copying anything.
+
+      bucket: :my-bucket to-bucket: :my-bucket from-profile: :staging to-profile: :production
+      "" Really sync across two AWS accounts: file data streams through this machine, metadata (ContentType etc) is preserved.
 
   delete:
     description:
@@ -280,9 +343,12 @@ main: (options) ->
       """
         S3 summarize, compare, copy, sync and more with massively parallel power.
 
-        Configure AWS credentials with environment variables:
+        Configure AWS credentials with environment variables or --profile:
           s3p uses the same creds as the aws-cli. Learn more:
           https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-configure.html
+
+        Working across two accounts/regions/endpoints? See the
+        --from-profile/--to-profile (and related) options on compare, cp and sync.
 
         Source: https://github.com/generalui/s3p
 

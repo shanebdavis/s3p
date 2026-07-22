@@ -6,7 +6,7 @@
   "bugs": "https:/github.com/shanebdavis/s3p/issues",
   "dependencies": {
     "@art-suite/cli": "2.2",
-    "@aws-sdk/client-s3": "^3.436.0",
+    "@aws-sdk/client-s3": "^3.598.0",
     "@aws-sdk/lib-storage": "^3.635.0",
     "@smithy/node-http-handler": "^4.5.2",
     "art-class-system": "^1.11.13",

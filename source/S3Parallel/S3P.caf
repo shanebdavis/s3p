@@ -382,6 +382,7 @@ class S3P
       stats
       pretend
       verbose
+      quiet
       copyConcurrency
       largeCopyConcurrency
       maxQueueSize
@@ -524,8 +525,9 @@ class S3P
             stats.copiedBytes += Size
 
           .catch (error) ->
-            if /NoSuchKey: The specified key does not exist/.test error.stack
-              if verbose then log "" skipping because "NoSuchKey: The specified key does not exist": #{key} (#{Size} bytes)
+            stats.copyingBytesInFlight -= Size
+            if error.name == :NoSuchKey || error.name == :NotFound || /NoSuchKey|NotFound/.test error.message
+              unless quiet then log.warn "" s3p: skipping missing key (source deleted during operation): #{key} (#{humanByteSize Size})
               stats.keyDoesNotExistFiles =
                 stats.keyDoesNotExistFiles ? 0
                 + 1

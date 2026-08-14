@@ -129,3 +129,83 @@ describe
           assert.selectedEq
             items:  files.length
             result
+
+  copy: ->
+    ## helper: mock S3 with a copy method that rejects with NoSuchKey for specific keys
+    mockS3WithFailingCopy = (keys, failKeys) ->
+      base = mockS3 keys...
+      merge base,
+        copy: (options) ->
+          key = options.key ? options.fromKey
+          if key in failKeys
+            error = new Error "" The specified key does not exist.
+            error.name = :NoSuchKey
+            Promise.reject error
+          else
+            Promise.resolve {}
+
+        extractCommonCopyOptions: -> {}
+
+    test "NoSuchKey during copy is handled as warning, not crash" ->
+      S3P.copy
+        quiet: true
+        bucket: :source-bucket
+        toBucket: :dest-bucket
+        s3: mockS3WithFailingCopy
+          [] :alpha :beta :gamma
+          [] :beta
+        toS3: {} s3: copyObject: -> Promise.resolve {}
+
+      .then ({finalStats}) ->
+        assert.eq finalStats.copiedFiles, 2
+        assert.eq finalStats.keyDoesNotExistFiles, 1
+
+    test "NotFound during copy is handled as warning (headObject case)" ->
+      mockS3WithNotFound = (keys, failKeys) ->
+        base = mockS3 keys...
+        merge base,
+          copy: (options) ->
+            key = options.key ? options.fromKey
+            if key in failKeys
+              error = new Error "" Not Found
+              error.name = :NotFound
+              Promise.reject error
+            else
+              Promise.resolve {}
+
+          extractCommonCopyOptions: -> {}
+
+      S3P.copy
+        quiet: true
+        bucket: :source-bucket
+        toBucket: :dest-bucket
+        s3: mockS3WithNotFound
+          [] :file1 :file2 :file3
+          [] :file1 :file3
+        toS3: {} s3: copyObject: -> Promise.resolve {}
+
+      .then ({finalStats}) ->
+        assert.eq finalStats.copiedFiles, 1
+        assert.eq finalStats.keyDoesNotExistFiles, 2
+
+    test "non-NoSuchKey errors still propagate to failed list" ->
+      mockS3WithOtherError = (keys) ->
+        base = mockS3 keys...
+        merge base,
+          copy: ->
+            Promise.reject new Error :AccessDenied
+
+          extractCommonCopyOptions: -> {}
+
+      S3P.copy
+        quiet: true
+        bucket: :source-bucket
+        toBucket: :dest-bucket
+        s3: mockS3WithOtherError [] :alpha
+        toS3: {} s3: copyObject: -> Promise.resolve {}
+
+      .then ({finalStats}) ->
+        assert.eq finalStats.copiedFiles, 0
+        assert.ok finalStats.failed is Array
+        failed = finalStats.failed
+        assert.eq 1, failed.length

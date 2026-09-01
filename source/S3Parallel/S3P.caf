@@ -535,6 +535,9 @@ class S3P
               largeCopyPartSize
               largeCopyPartConcurrency
               streamQueueSize
+              # let the adaptive pool see transient failures even though s3.copy
+              # retries and (usually) succeeds - otherwise it would only ever grow
+              onTransientFailure: -> pool.notifyTransientFailure?()
 
           s3.copy options
           .then ->

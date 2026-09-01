@@ -1,5 +1,21 @@
 import &path, &ArtStandardLib, &ArtClassSystem, &Lib
 
+# Options for an adaptive (AIMD) copy worker pool. The window starts small and
+# grows on success / halves on transient connection failure, so concurrency
+# ramps up like TCP slow-start instead of jumping straight to the ceiling and
+# provoking "socket hang up" bursts.
+# Logging (unless quiet) is sparse to avoid a line per +1: every backoff, and
+# growth only when the window crosses a multiple of 20 (or reaches the ceiling).
+adaptiveCopyPoolOptions = (maxWorkers, label, quiet) ->
+  adaptive: true
+  isTransientError: (error) -> (&Lib/S3).isTransientError error
+  onLimitChange: (newLimit, oldLimit, reason) ->
+    return if quiet
+    if reason == :backoff
+      log "" s3p: #{label}-concurrency backoff #{oldLimit} -> #{newLimit} (max #{maxWorkers}) - transient errors, easing off
+    else if newLimit == maxWorkers || (newLimit % 20 == 0 && (newLimit / 20 | 0) != (oldLimit / 20 | 0))
+      log "" s3p: #{label}-concurrency #{newLimit} (max #{maxWorkers})
+
 class S3Comprehensions
 
   @normalizeOptions: (options) =>
@@ -24,8 +40,8 @@ class S3Comprehensions
       copyConcurrency       = 500
       largeCopyConcurrency  = 75
       maxQueueSize          = copyConcurrency * 100
-      copyPwp               = new PromiseWorkerPool copyConcurrency
-      largeCopyPwp          = new PromiseWorkerPool largeCopyConcurrency
+      copyPwp               = new PromiseWorkerPool copyConcurrency, adaptiveCopyPoolOptions copyConcurrency, :copy, quiet
+      largeCopyPwp          = new PromiseWorkerPool largeCopyConcurrency, adaptiveCopyPoolOptions largeCopyConcurrency, :large-copy, quiet
       largeCopyThreshold    = 100 * 1024 ** 2
 
     withFn = options.with

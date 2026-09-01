@@ -1,25 +1,71 @@
 import &ArtStandardLib, &ArtClassSystem
 
-## TODO
-  PWP should
+## PromiseWorkerPool
+  A bounded-concurrency job queue with adaptive concurrency (AIMD, like TCP
+  congestion control).
 
-  - allow an amount of queueing in any order. A queue action automatically starts up 'workers'
-  - .then could be configured to resolve on the next "empty queue", but really we don't need that for now.
+  Instead of jumping straight to maxWorkers, the effective concurrency limit
+  starts small and grows toward maxWorkers, and halves on each transient failure
+  (multiplicative decrease) down to a floor of 1. This spreads out new
+  connections rather than opening hundreds at once, avoiding the "socket hang up"
+  bursts that a sudden jump to full concurrency provokes, while still climbing
+  back to full speed when the network is healthy.
+
+  Growth is gated so the window can't inflate while the pool is lightly loaded
+  (which would let a later burst launch the whole stale window at once - the
+  classic idle-grown-congestion-window stampede): the limit only grows on a
+  success when the pool is SATURATED (active jobs >= current limit, i.e. we are
+  actually using all the concurrency we have), and is additionally clamped to
+  never exceed activeWorkers + growthHeadroom. So a burst can launch at most
+  ~growthHeadroom new connections, then grows step-by-step as those succeed.
+
+  new PromiseWorkerPool maxWorkers, options:
+    adaptive:         default true. Set false for a fixed maxWorkers window.
+    isTransientError: (error) -> Bool - only failures it flags as transient
+      shrink the window (others don't count as congestion). Defaults to treating
+      every failure as transient.
+    startLimit:       initial window (default: min 4, maxWorkers)
+    growthHeadroom:   max the window may exceed current active workers (default
+      50) - bounds how many new connections a burst can open at once.
+    onLimitChange:    (newLimit, oldLimit, reason) -> ... - called whenever the
+      window changes ('grow' or 'backoff'). Use for progress logging.
 
 class PromiseWorkerPool extends BaseClass
 
-  constructor: (@_maxWorkers = 10) ->
+  constructor: (@_maxWorkers = 10, options = {}) ->
+    @_adaptive         = options.adaptive ? true
+    @_isTransientError = options.isTransientError ? -> true
+    @_onLimitChange    = options.onLimitChange
+    # after a backoff, ignore further transient failures for this long, so a
+    # single correlated burst (e.g. 100 in-flight copies all failing at once when
+    # the network hiccups) halves the window ONCE, not into the floor.
+    @_backoffCooldownMs = options.backoffCooldownMs ? 1000
+    @_growthHeadroom    = options.growthHeadroom ? 50
+    @_lastBackoffAt = 0
     @_stats =
       jobs: queued: 0 started: 0 succeeded: 0 failed: 0
       maxActiveWorkers: 0
     @_queue = []
-    @_availableWorkers = @_maxWorkers
+    @_active = 0
+    @_startLimit = Math.max 1, Math.min options.startLimit ? 4, @_maxWorkers
+    # dynamic concurrency window; equals _maxWorkers in non-adaptive mode
+    @_limit =
+      if @_adaptive
+        @_startLimit
+      else @_maxWorkers
 
   @getter :stats
   @getter
-    queueSize: -> @_queue.length
-    activeWorkers: -> @_maxWorkers - @_availableWorkers
+    queueSize:     -> @_queue.length
+    activeWorkers: -> @_active
+    limit:         -> @_limit
 
+  _setLimit: (newLimit, reason) ->
+    newLimit = Math.max 1, Math.min newLimit, @_maxWorkers
+    if newLimit != @_limit
+      old = @_limit
+      @_limit = newLimit
+      @_onLimitChange? newLimit, old, reason
 
   # OUT: a promise that resolves/rejects job's return value or error
   #   Except that the promise might be delayed if there are no workers available
@@ -31,18 +77,67 @@ class PromiseWorkerPool extends BaseClass
         @_stats.jobs.started++
         Promise
         .then job
-        .tap -> @_stats.jobs.succeeded++
-        .tapCatch -> @_stats.jobs.failed++
+        .tap ->
+          @_stats.jobs.succeeded++
+          @_onSuccess()
+        .tapCatch (error) ->
+          @_stats.jobs.failed++
+          @_onFailure error
         .then resolve, reject
       @_work()
 
+  ## _onSuccess: additive increase (adaptive mode only)
+    Only grow when the pool is SATURATED (active >= limit) so the window can't
+    inflate during light load, and never beyond active + growthHeadroom. This
+    prevents the window from silently opening up to maxWorkers while nearly idle
+    and then letting a later burst stampede the whole stale window at once.
+  _onSuccess: ->
+    return unless @_adaptive
+    return if @_limit >= @_maxWorkers
+    return if @_active < @_limit # not saturated: no evidence we can use more
+    return if @_limit >= @_active + @_growthHeadroom # keep the window near actual usage
+    @_setLimit @_limit + 1, :grow
+    @_work() # a newly-freed window slot may let a queued job start
+
+  ## notifyTransientFailure: multiplicative decrease (adaptive mode only)
+    Call this when a job hits a transient (congestion) error, EVEN IF the job
+    then retries internally and ultimately succeeds. The pool otherwise only
+    sees the final success and would never back off - see S3.copy, whose own
+    _withTransientRetry swallows the failure before the job resolves.
+    Debounced: a burst within backoffCooldownMs counts as ONE halving.
+  notifyTransientFailure: ->
+    return unless @_adaptive
+    now = Date.now()
+    if now - @_lastBackoffAt >= @_backoffCooldownMs
+      @_lastBackoffAt = now
+      @_setLimit @_limit >> 1, :backoff
+
+  ## _onFailure: back off when a job REJECTS with a transient error
+    (belt-and-suspenders; most transient errors are reported via
+    notifyTransientFailure before the job resolves)
+  _onFailure: (error) ->
+    @notifyTransientFailure() if @_isTransientError error
+
   _work: ->
-    if @_availableWorkers > 0 && work = @_queue.pop()
-      @_finishWork ?= ->
-        @_availableWorkers++
+    if @_active < @_limit && work = @_queue.pop()
+      @_finishWork ?= =>
+        @_active--
+        @_decayTowardUsage()
         @_work()
 
-      @_availableWorkers--
-      @_stats.maxActiveWorkers = max @_stats.maxActiveWorkers, @activeWorkers
+      @_active++
+      @_stats.maxActiveWorkers = max @_stats.maxActiveWorkers, @_active
       Promise.then work
       .finally @_finishWork
+
+  ## _decayTowardUsage: keep the window near actual usage (adaptive mode only)
+    TCP congestion-window-validation: a window that grew to a high value during
+    a dense region must not stay wide open after the pool drains, or the next
+    burst would stampede the whole stale window at once (re-provoking socket
+    hang ups). So as workers finish, shrink the limit toward active + headroom
+    (never below the startLimit floor). A fresh burst then launches at most
+    ~headroom and ramps back up as those succeed.
+  _decayTowardUsage: ->
+    return unless @_adaptive
+    target = Math.max @_startLimit, @_active + @_growthHeadroom
+    @_setLimit target, :decay if target < @_limit

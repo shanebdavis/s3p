@@ -1,5 +1,11 @@
 import &StandardImport
 
+# module-level helper (module scope parses cleanly, unlike a nested one-liner)
+transientError = ->
+  e = new Error "socket hang up"
+  e.name = "TimeoutError"
+  e
+
 test :pwp ->
   currentlyActive = 0
   maxActive = 0
@@ -7,20 +13,161 @@ test :pwp ->
 
   doWork = ->
     currentlyActive++
-    # log "" work-start #{currentlyActive}/#{maxActive}
     maxActive = max currentlyActive, maxActive
     timeout 1
     .then ->
       totalDone++
-      # log "" work-end #{currentlyActive}/#{maxActive}
       currentlyActive--
 
-  pwp = new PromiseWorkerPool poolSize = 10
+  # non-adaptive: reaches full pool size immediately
+  poolSize = 10
+  nonAdaptiveOptions = adaptive: false
+  pwp = new PromiseWorkerPool poolSize, nonAdaptiveOptions
 
   Promise.all array til numQueued = 100
     pwp.queue doWork
 
   .then ->
-    log {} currentlyActive, maxActive, poolSize, numQueued
     assert.eq maxActive, poolSize
     assert.eq totalDone, numQueued
+
+test :pwp_adaptive_grows ->
+  # adaptive window starts small (4) and grows by 1 per success toward the max
+  adaptiveOptions = adaptive: true, startLimit: 4
+  pwp = new PromiseWorkerPool 50, adaptiveOptions
+  assert.eq pwp.limit, 4
+
+  Promise.all array til 500
+    pwp.queue -> timeout 1
+  .then ->
+    assert.eq pwp.limit, 50 # climbed to the ceiling (saturated the whole time)
+
+test :pwp_adaptive_light_load_does_not_inflate ->
+  # light load: never more than 2 jobs at a time, run serially. The window must
+  # NOT climb to the ceiling - otherwise a later burst would stampede.
+  options = adaptive: true, startLimit: 4
+  pwp = new PromiseWorkerPool 500, options
+
+  runOne = (i) ->
+    return Promise.resolve() if i >= 100
+    pwp.queue -> timeout 1
+    .then -> runOne i + 1
+  runOne 0
+  .then ->
+    # 100 serial successes, but only ~1 active at a time => never saturated =>
+    # window stays at its start, nowhere near 500
+    assert.ok pwp.limit <= 4, "expected window to stay small, got #{pwp.limit}"
+
+test :pwp_adaptive_headroom_invariant ->
+  # the window must never run more than growthHeadroom ahead of active workers,
+  # checked continuously during a saturated run
+  headroom = 10
+  options = adaptive: true, startLimit: 4, growthHeadroom: headroom
+  pwp = new PromiseWorkerPool 500, options
+
+  violated = false
+  check = ->
+    violated = true if pwp.limit > pwp.activeWorkers + headroom + 1
+
+  Promise.all array til 300
+    pwp.queue ->
+      check()
+      timeout 1
+      .then check
+  .then ->
+    assert.eq violated, false
+    # sanity: it still ramped up well past the start under sustained load
+    assert.ok pwp.limit > 4
+
+test :pwp_adaptive_decays_after_drain ->
+  # after a dense region grows the window, draining must bring it back down
+  # toward startLimit + headroom, so the next burst can't stampede the stale
+  # (large) window.
+  headroom = 5
+  peak = 0
+  options =
+    adaptive: true
+    startLimit: 4
+    growthHeadroom: headroom
+    onLimitChange: (newLimit) -> peak = max peak, newLimit
+  pwp = new PromiseWorkerPool 500, options
+
+  # dense region: saturate to grow the window
+  Promise.all array til 200
+    pwp.queue -> timeout 1
+  .then ->
+    # let the last workers' .finally (decrement + decay) flush
+    timeout 5
+  .then ->
+    assert.ok peak > 20, "expected window to have grown during the run, peak was #{peak}"
+    # pool has now fully drained; the window must have decayed toward the floor
+    assert.eq pwp.activeWorkers, 0
+    assert.ok pwp.limit <= 4 + headroom, "expected decay to <= #{4 + headroom}, got #{pwp.limit}"
+
+test :pwp_adaptive_backoff ->
+  # backoffCooldownMs: 0 so each transient failure counts (no debounce)
+  options =
+    adaptive: true
+    startLimit: 40
+    backoffCooldownMs: 0
+    isTransientError: (error) -> error?.name == "TimeoutError"
+  pwp = new PromiseWorkerPool 100, options
+
+  assert.eq pwp.limit, 40
+
+  # one transient failure -> halve to 20
+  pwp.queue -> Promise.reject transientError()
+  .catch -> null
+  .then ->
+    assert.eq pwp.limit, 20
+
+    # a non-transient failure must NOT change the window
+    pwp.queue -> Promise.reject new Error "AccessDenied"
+    .catch -> null
+    .then ->
+      assert.eq pwp.limit, 20
+
+test :pwp_adaptive_burst_debounced ->
+  # a burst of concurrent transient failures within the cooldown = ONE halving
+  options =
+    adaptive: true
+    startLimit: 40
+    backoffCooldownMs: 10000 # long cooldown: subsequent failures ignored
+    isTransientError: -> true
+  pwp = new PromiseWorkerPool 100, options
+
+  Promise.all array til 50
+    pwp.queue -> Promise.reject transientError()
+    .catch -> null
+  .then ->
+    # 50 failures in one burst -> halved once (40 -> 20), not into the floor
+    assert.eq pwp.limit, 20
+
+test :pwp_notify_transient_failure_backs_off ->
+  # a job that succeeds but reports a transient failure should still back off
+  options =
+    adaptive: true
+    startLimit: 40
+    backoffCooldownMs: 0
+  pwp = new PromiseWorkerPool 100, options
+
+  assert.eq pwp.limit, 40
+  pwp.notifyTransientFailure()
+  assert.eq pwp.limit, 20
+  pwp.notifyTransientFailure()
+  assert.eq pwp.limit, 10
+
+test :pwp_adaptive_reports_changes ->
+  changes = []
+  options =
+    adaptive: true
+    startLimit: 2
+    onLimitChange: (newLimit, oldLimit, reason) -> changes.push {} newLimit, oldLimit, reason
+  pwp = new PromiseWorkerPool 10, options
+
+  Promise.all array til 20
+    pwp.queue -> timeout 1
+  .then ->
+    assert.ok changes.length > 0
+    growEvents = array c in-array changes when c.reason == :grow
+    assert.ok growEvents.length > 0

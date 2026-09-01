@@ -142,7 +142,7 @@ class S3 extends BaseClass
     :ECONNABORTED
     :ERR_SOCKET_CONNECTION_TIMEOUT
 
-  _isTransientError: (error) ->
+  @isTransientError: (error) ->
     return false unless error
     name    = error.name
     code    = error.code ? error.Code
@@ -152,17 +152,24 @@ class S3 extends BaseClass
     matchesMessage = /socket hang up|socket disconnected|timeout|ECONNRESET|EPIPE|network|hangup/i.test message
     isTimeout || isCode || matchesMessage
 
+  _isTransientError: (error) -> S3.isTransientError error
+
   ## _withTransientRetry
     Retry fn() on transient connection errors with exponential backoff + jitter.
     The SDK's own retries handle service errors (throttling, 5xx); this catches
     the connection-reset class the SDK gives up on, so a single "socket hang up"
     never propagates up to eachRecursive and aborts the whole operation.
     Non-transient errors (NoSuchKey, AccessDenied, ...) rethrow immediately.
-  _withTransientRetry: (label, fn) ->
+    The optional third argument, onTransientFailure, is invoked on each transient
+    failure before the retry, so callers like an adaptive worker pool can react to
+    the congestion signal even though the job ultimately succeeds after retrying.
+  _withTransientRetry: (label, fn, onTransientFailure) ->
     maxAttempts = @maxAttempts ? 5
     attempt = (n) =>
       Promise.then fn
       .catch (error) =>
+        if @_isTransientError error
+          onTransientFailure?()
         if n < maxAttempts && @_isTransientError error
           # exponential backoff (base 250ms) capped at 5s, with full jitter
           delay = Math.min 5000, 250 * 2 ** (n - 1)
@@ -262,6 +269,7 @@ class S3 extends BaseClass
         sdkCopyOptions:           @_getCommonCopyOptionsForSdk options
         largeCopyPartSize:        options.largeCopyPartSize
         largeCopyPartConcurrency: options.largeCopyPartConcurrency
+        onTransientFailure:       options.onTransientFailure
 
     else
       copyOptions = merge
@@ -329,8 +337,8 @@ class S3 extends BaseClass
           streamQueueSize: options.streamQueueSize
 
       else
-        @_withTransientRetry "copy #{toBucket}/#{toKey}", ->
-          toS3.s3.copyObject copyOptions
+        doCopy = -> toS3.s3.copyObject copyOptions
+        @_withTransientRetry "copy #{toBucket}/#{toKey}", doCopy, options.onTransientFailure
 
   delete: (options) ->
     @_withTransientRetry "delete #{options.bucket}/#{options.key}", =>
@@ -395,7 +403,7 @@ class S3 extends BaseClass
     .then ({UploadId}) =>
       Promise.all array {PartNumber, CopySourceRange} in-array parts
         partPwp.queue =>
-          @_withTransientRetry "uploadPartCopy #{toBucket}/#{toKey}#part#{PartNumber}", ->
+          doUploadPart = ->
             toS3.s3.uploadPartCopy {}
               Bucket:     toBucket
               Key:        toKey
@@ -404,6 +412,7 @@ class S3 extends BaseClass
               CopySource: copySource
               CopySourceRange
             .then ({CopyPartResult}) -> {} PartNumber, ETag: CopyPartResult.ETag
+          @_withTransientRetry "uploadPartCopy #{toBucket}/#{toKey}#part#{PartNumber}", doUploadPart, options.onTransientFailure
 
       .then (completedParts) ->
         toS3.s3.completeMultipartUpload

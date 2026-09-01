@@ -249,6 +249,9 @@ class S3P
       profile
       credentials
       maxSockets
+      maxAttempts
+      connectionTimeout
+      requestTimeout
       listConcurrency = 100
       s3
 
@@ -260,7 +263,7 @@ class S3P
 
     deletePwp ?= new PromiseWorkerPool deleteConcurrency
     maxSockets ?= deleteConcurrency + listConcurrency
-    s3 ?= new &Lib/S3 {} region, endpoint, useAccelerateEndpoint, profile, credentials, maxSockets, verbose
+    s3 ?= new &Lib/S3 {} region, endpoint, useAccelerateEndpoint, profile, credentials, maxSockets, maxAttempts, connectionTimeout, requestTimeout, verbose
 
     stats ?= {}
     stats.deletedFiles = 0
@@ -395,6 +398,9 @@ class S3P
       useAccelerateEndpoint
       endpoint
       maxSockets
+      maxAttempts
+      connectionTimeout
+      requestTimeout
       listConcurrency = 100
       profile
       fromProfile
@@ -421,6 +427,9 @@ class S3P
       credentials:  fromCredentials
       useAccelerateEndpoint
       maxSockets
+      maxAttempts
+      connectionTimeout
+      requestTimeout
       verbose
 
     # destination-side client: server-side copy commands must be sent to the
@@ -434,6 +443,9 @@ class S3P
           credentials:  toCredentials
           useAccelerateEndpoint
           maxSockets
+          maxAttempts
+          connectionTimeout
+          requestTimeout
           verbose
       else s3
 

@@ -263,6 +263,9 @@ class S3Comprehensions
       useAccelerateEndpoint
       endpoint
       maxSockets
+      maxAttempts
+      connectionTimeout
+      requestTimeout
       verbose
       profile
 
@@ -288,6 +291,9 @@ class S3Comprehensions
       profile:      fromProfile ? profile
       credentials:  fromCredentials
       maxSockets
+      maxAttempts
+      connectionTimeout
+      requestTimeout
       verbose
       useAccelerateEndpoint: !!useAccelerateEndpoint
 
@@ -301,6 +307,9 @@ class S3Comprehensions
           profile:      toProfile ? profile
           credentials:  toCredentials
           maxSockets
+          maxAttempts
+          connectionTimeout
+          requestTimeout
           verbose
           useAccelerateEndpoint: !!useAccelerateEndpoint
       else s3

@@ -1,0 +1,110 @@
+import &StandardImport, &TestLib
+
+# builds a "socket hang up" style TimeoutError like the one in fail2.log
+socketHangUp = ->
+  e = new Error "socket hang up"
+  e.name = "TimeoutError"
+  e
+
+# a real S3 instance whose underlying SDK send() is stubbed. sendImpl receives
+# the attempt number (1-based) and returns/throws to simulate the SDK.
+stubbedS3 = (sendImpl) ->
+  # tiny maxAttempts keeps backoff short; base delay is 250ms * 2^(n-1) jittered
+  s3 = new S3 region: "us-east-1", maxAttempts: 4
+  callCount = 0
+  s3.awsSdkS3.send = (command) ->
+    callCount++
+    Promise.then -> sendImpl callCount, command
+  s3._sendCallCount = -> callCount
+  s3
+
+describe
+  isTransientError: ->
+    test "classifies socket hang up / TimeoutError as transient" ->
+      s3 = new S3 region: "us-east-1"
+      assert.eq s3._isTransientError(socketHangUp()), true
+
+    test "classifies raw socket error codes as transient" ->
+      s3 = new S3 region: "us-east-1"
+      each code in [] "ECONNRESET" "ETIMEDOUT" "EPIPE" "ENOTFOUND"
+        e = new Error "boom"
+        e.code = code
+        assert.eq s3._isTransientError(e), true
+
+    test "does NOT classify NoSuchKey / AccessDenied as transient" ->
+      s3 = new S3 region: "us-east-1"
+      each name in [] "NoSuchKey" "AccessDenied" "NotFound"
+        e = new Error name
+        e.name = name
+        assert.eq s3._isTransientError(e), false
+
+  listRetry: ->
+    okResult = -> Contents: [] {} Key: "a", Size: 1
+
+    test "list retries a transient failure and then succeeds" ->
+      s3 = stubbedS3 (n) ->
+        if n < 3 then throw socketHangUp()  # fail attempts 1 and 2
+        else okResult()                     # succeed on attempt 3
+      s3.list bucket: "b"
+      .then (contents) ->
+        assert.eq 3, s3._sendCallCount()
+        assert.eq 1, contents.length
+
+    test "list gives up after maxAttempts and rethrows the transient error" ->
+      s3 = stubbedS3 (n) -> throw socketHangUp() # always fails
+      s3.list bucket: "b"
+      .then -> assert.ok false, "expected list to reject"
+      .catch (error) ->
+        assert.eq "TimeoutError", error.name
+        assert.eq 4, s3._sendCallCount() # maxAttempts
+
+    test "list does NOT retry a non-transient error" ->
+      s3 = stubbedS3 (n) ->
+        e = new Error "denied"
+        e.name = "AccessDenied"
+        throw e
+      s3.list bucket: "b"
+      .then -> assert.ok false, "expected list to reject"
+      .catch (error) ->
+        assert.eq "AccessDenied", error.name
+        assert.eq 1, s3._sendCallCount() # no retry
+
+  copyRetry: ->
+    # server-side copy path: same bucket, small size -> single copyObject send
+    copyOpts = {} bucket: "b", key: "k", size: 10
+
+    test "server-side copy retries a transient failure and then succeeds" ->
+      s3 = stubbedS3 (n) ->
+        if n < 3 then throw socketHangUp()
+        else {} CopyObjectResult: {}
+      s3.copy copyOpts
+      .then ->
+        assert.eq 3, s3._sendCallCount()
+
+    test "server-side copy gives up after maxAttempts on a transient error" ->
+      s3 = stubbedS3 (n) -> throw socketHangUp()
+      s3.copy copyOpts
+      .then -> assert.ok false, "expected copy to reject"
+      .catch (error) ->
+        assert.eq "TimeoutError", error.name
+        assert.eq 4, s3._sendCallCount()
+
+    test "server-side copy does NOT retry a non-transient error" ->
+      s3 = stubbedS3 (n) ->
+        e = new Error "denied"
+        e.name = "AccessDenied"
+        throw e
+      s3.copy copyOpts
+      .then -> assert.ok false, "expected copy to reject"
+      .catch (error) ->
+        assert.eq "AccessDenied", error.name
+        assert.eq 1, s3._sendCallCount()
+
+  deleteRetry: ->
+    test "delete retries a transient failure and then succeeds" ->
+      s3 = stubbedS3 (n) ->
+        if n < 2 then throw socketHangUp()
+        else {}
+      s3.delete bucket: "b", key: "k"
+      .then ->
+        assert.eq 2, s3._sendCallCount()

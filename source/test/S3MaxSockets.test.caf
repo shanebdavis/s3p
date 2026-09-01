@@ -19,3 +19,30 @@ describe
       s3.awsSdkS3.config.requestHandler.configProvider
       .then (config) ->
         assert.eq config.httpsAgent.maxSockets, 50
+
+    # the fail.log cascade: at high concurrency, transient "socket hang up" /
+    # TimeoutError used to abort the whole sync. These are retryable and usually
+    # recover on the next try, so we retry with adaptive mode instead of
+    # propagating the first one.
+    test "configures adaptive retries by default" ->
+      s3 = new S3 region: "us-east-1"
+      Promise.resolve s3.awsSdkS3.config.maxAttempts()
+      .then (maxAttempts) ->
+        assert.eq maxAttempts, 5
+      .then ->
+        Promise.resolve s3.awsSdkS3.config.retryStrategy()
+        .then (retryStrategy) -> assert.eq retryStrategy.mode, "adaptive"
+
+    test "maxAttempts is overridable" ->
+      s3 = new S3 region: "us-east-1", maxAttempts: 3
+      Promise.resolve s3.awsSdkS3.config.maxAttempts()
+      .then (maxAttempts) -> assert.eq maxAttempts, 3
+
+    # a stuck socket must fail fast (and get retried) rather than hang forever
+    test "sets connection & request timeouts (throwing) when maxSockets is set" ->
+      s3 = new S3 region: "us-east-1", maxSockets: 600, connectionTimeout: 1234, requestTimeout: 5678
+      s3.awsSdkS3.config.requestHandler.configProvider
+      .then (config) ->
+        assert.eq config.connectionTimeout, 1234
+        assert.eq config.requestTimeout, 5678
+        assert.eq config.throwOnRequestTimeout, true

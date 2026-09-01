@@ -249,6 +249,9 @@ class S3P
       profile
       credentials
       maxSockets
+      maxAttempts
+      connectionTimeout
+      requestTimeout
       listConcurrency = 100
       s3
 
@@ -260,7 +263,7 @@ class S3P
 
     deletePwp ?= new PromiseWorkerPool deleteConcurrency
     maxSockets ?= deleteConcurrency + listConcurrency
-    s3 ?= new &Lib/S3 {} region, endpoint, useAccelerateEndpoint, profile, credentials, maxSockets, verbose
+    s3 ?= new &Lib/S3 {} region, endpoint, useAccelerateEndpoint, profile, credentials, maxSockets, maxAttempts, connectionTimeout, requestTimeout, verbose
 
     stats ?= {}
     stats.deletedFiles = 0
@@ -382,18 +385,28 @@ class S3P
       stats
       pretend
       verbose
+      quiet
       copyConcurrency
       largeCopyConcurrency
       maxQueueSize
       copyPwp
       largeCopyPwp
       largeCopyThreshold
+      # opt-in: continue past copies that exhaust their transient-error retries,
+      # instead of aborting. Default false: an exhausted transient copy is fatal,
+      # because skipping it produces an INCOMPLETE copy and that must be a
+      # conscious choice. When true, such files are logged and counted in
+      # finalStats.transientCopyFailure{Files,Bytes} and the run continues.
+      skipFailedTransientCopies = false
 
       # s3 options
       region
       useAccelerateEndpoint
       endpoint
       maxSockets
+      maxAttempts
+      connectionTimeout
+      requestTimeout
       listConcurrency = 100
       profile
       fromProfile
@@ -420,6 +433,9 @@ class S3P
       credentials:  fromCredentials
       useAccelerateEndpoint
       maxSockets
+      maxAttempts
+      connectionTimeout
+      requestTimeout
       verbose
 
     # destination-side client: server-side copy commands must be sent to the
@@ -433,6 +449,9 @@ class S3P
           credentials:  toCredentials
           useAccelerateEndpoint
           maxSockets
+          maxAttempts
+          connectionTimeout
+          requestTimeout
           verbose
       else s3
 
@@ -516,6 +535,9 @@ class S3P
               largeCopyPartSize
               largeCopyPartConcurrency
               streamQueueSize
+              # let the adaptive pool see transient failures even though s3.copy
+              # retries and (usually) succeeds - otherwise it would only ever grow
+              onTransientFailure: -> pool.notifyTransientFailure?()
 
           s3.copy options
           .then ->
@@ -524,14 +546,36 @@ class S3P
             stats.copiedBytes += Size
 
           .catch (error) ->
-            if /NoSuchKey: The specified key does not exist/.test error.stack
-              if verbose then log "" skipping because "NoSuchKey: The specified key does not exist": #{key} (#{Size} bytes)
+            stats.copyingBytesInFlight -= Size
+            if error.name == :NoSuchKey || error.name == :NotFound || /NoSuchKey|NotFound/.test error.message
+              unless quiet then log.warn "" s3p: skipping missing key (source deleted during operation): #{key} (#{humanByteSize Size})
               stats.keyDoesNotExistFiles =
                 stats.keyDoesNotExistFiles ? 0
                 + 1
               stats.keyDoesNotExistBytes =
                 stats.keyDoesNotExistBytes ? 0
                 + Size
+
+            else if s3._isTransientError error
+              # transient connection error that exhausted all retries (see S3._withTransientRetry).
+              unless skipFailedTransientCopies
+                # DEFAULT: fatal. Skipping would leave an incomplete copy silently;
+                # abort so the incompleteness is a conscious, opt-in choice.
+                log.error "" s3p: ABORTING - transient copy failure after retries: s3://#{options.toBucket}/#{key} (#{humanByteSize Size}) - #{error.name}: #{error.message}. Re-run, lower --copy-concurrency/--list-concurrency, or pass --skip-failed-transient-copies to skip and continue.
+                throw error
+
+              # opt-in: record the skipped file and continue (a re-sync will pick it up)
+              log.warn "" s3p: SKIPPED (transient copy failure after retries): s3://#{options.toBucket}/#{key} (#{humanByteSize Size}) - #{error.name}: #{error.message}
+              stats.transientCopyFailureFiles =
+                stats.transientCopyFailureFiles ? 0
+                + 1
+              stats.transientCopyFailureBytes =
+                stats.transientCopyFailureBytes ? 0
+                + Size
+              stats.transientCopyFailureKeys =
+                stats.transientCopyFailureKeys ? []
+                .concat key
+
             else throw error
 
     .then (stats) ->

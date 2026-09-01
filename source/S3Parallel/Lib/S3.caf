@@ -57,6 +57,21 @@ class S3 extends BaseClass
       maxSockets: number, default: undefined (SDK default: 50)
         Max concurrent HTTP connections. Size this to match the number of
         concurrent SDK calls or requests queue inside the HTTP handler.
+      maxAttempts: number, default: 5
+        Total tries per request (1 initial + retries). At high concurrency S3
+        and the network drop connections ("socket hang up" / TimeoutError);
+        these are transient and retryable and usually recover on the next try,
+        so we retry (5 attempts) rather than aborting the whole operation. Uses
+        the SDK's ADAPTIVE retry mode, which also client-side rate-limits when
+        S3 returns 503 SlowDown (reachable once the socket pool is large).
+      connectionTimeout: ms, default: 6000
+        Fail a socket that can't connect this fast (then retry) instead of
+        hanging.
+      requestTimeout: ms, default: 120000
+        Max time a single request/response may take before it is abandoned with
+        a TimeoutError (then retried). throwOnRequestTimeout is set so the
+        breach actually throws instead of only warning - bounding the "socket
+        hang up" hang so a stuck connection is retried, not fatal.
       verbose: boolean, log client configuration on creation
 
   constructor: (options = {}) ->
@@ -64,15 +79,30 @@ class S3 extends BaseClass
     endpoint = options.endpoint
     endpoint ?= process.env.S3_ENDPOINT if !profile
     maxSockets = options.maxSockets
+    maxAttempts       = options.maxAttempts ? 5
+    connectionTimeout = options.connectionTimeout ? 6000
+    requestTimeout    = options.requestTimeout ? 120000
+    @maxAttempts = maxAttempts
 
-    log "s3p: S3-client maxSockets: #{maxSockets ? 'SDK-default (50)'}" if options.verbose
+    log "s3p: S3-client maxSockets: #{maxSockets ? 'SDK-default (50)'} maxAttempts: #{maxAttempts}" if options.verbose
 
     @awsSdkS3 = new S3Client merge
       region: process.env.AWS_REGION
+      # ADAPTIVE retry + generous attempts: transient "socket hang up"/TimeoutError
+      # at high concurrency must be retried, not propagated (a single one used to
+      # abort the whole sync via eachRecursive). Adaptive mode also rate-limits on
+      # 503 SlowDown, which a large socket pool can provoke against one prefix.
+      {} maxAttempts, retryMode: "adaptive"
       if endpoint
         {} endpoint, forcePathStyle: true
       if maxSockets
-        requestHandler: new NodeHttpHandler
+        # timeouts turn a stuck socket into a fast, retryable failure instead of a hang
+        requestHandler: new NodeHttpHandler {}
+          connectionTimeout:  connectionTimeout
+          requestTimeout:     requestTimeout
+          # without this, a requestTimeout breach only logs a warning (legacy
+          # behavior); we need it to throw a TimeoutError so the SDK retries
+          throwOnRequestTimeout: true
           httpAgent:  new http.Agent  {} maxSockets, keepAlive: true
           httpsAgent: new https.Agent {} maxSockets, keepAlive: true
       {region, useAccelerateEndpoint, forcePathStyle, profile, credentials} = options
@@ -97,6 +127,60 @@ class S3 extends BaseClass
     .then ({Buckets}) ->
       object {Name, CreationDate} from Buckets with-key Name with CreationDate
 
+  ## _isTransientError
+    True for connection-level failures that the AWS SDK's retry classifier does
+    NOT reliably catch: "socket hang up" / TimeoutError and the raw socket error
+    codes (see aws-sdk-js-v3 #4666). At s3p's concurrency these happen routinely
+    and are safe to retry - a read-only list has no side effects.
+  @transientErrorCodes =
+    :ECONNRESET
+    :ETIMEDOUT
+    :ECONNREFUSED
+    :EPIPE
+    :ENOTFOUND
+    :EAI_AGAIN
+    :ECONNABORTED
+    :ERR_SOCKET_CONNECTION_TIMEOUT
+
+  @isTransientError: (error) ->
+    return false unless error
+    name    = error.name
+    code    = error.code ? error.Code
+    message = "#{error.message ? ''}"
+    isTimeout = name == "TimeoutError"
+    isCode    = code? && code in S3.transientErrorCodes
+    matchesMessage = /socket hang up|socket disconnected|timeout|ECONNRESET|EPIPE|network|hangup/i.test message
+    isTimeout || isCode || matchesMessage
+
+  _isTransientError: (error) -> S3.isTransientError error
+
+  ## _withTransientRetry
+    Retry fn() on transient connection errors with exponential backoff + jitter.
+    The SDK's own retries handle service errors (throttling, 5xx); this catches
+    the connection-reset class the SDK gives up on, so a single "socket hang up"
+    never propagates up to eachRecursive and aborts the whole operation.
+    Non-transient errors (NoSuchKey, AccessDenied, ...) rethrow immediately.
+    The optional third argument, onTransientFailure, is invoked on each transient
+    failure before the retry, so callers like an adaptive worker pool can react to
+    the congestion signal even though the job ultimately succeeds after retrying.
+  _withTransientRetry: (label, fn, onTransientFailure) ->
+    maxAttempts = @maxAttempts ? 5
+    attempt = (n) =>
+      Promise.then fn
+      .catch (error) =>
+        if @_isTransientError error
+          onTransientFailure?()
+        if n < maxAttempts && @_isTransientError error
+          # exponential backoff (base 250ms) capped at 5s, with full jitter
+          delay = Math.min 5000, 250 * 2 ** (n - 1)
+          delay = (Math.random() * delay) | 0
+          errorSummary = "#{error.name}: #{error.message}"
+          log.warn "s3p: transient-retry #{n}/#{maxAttempts} in #{delay}ms - #{label} - #{errorSummary}"
+          timeout delay
+          .then -> attempt n + 1
+        else throw error
+    attempt 1
+
   ## list
     OUT:
       []
@@ -108,12 +192,14 @@ class S3 extends BaseClass
         Owner
   list: ({bucket, prefix, limit=1000, fetchOwner, startAfter, stopAt}) ->
     startTime = currentSecond()
-    @s3.listObjectsV2
-      Bucket:     bucket
-      Prefix:     prefix
-      MaxKeys:    limit
-      StartAfter: startAfter
-      FetchOwner: fetchOwner
+    label = "list #{bucket}/#{prefix ? ''}@#{startAfter ? ''}"
+    @_withTransientRetry label, =>
+      @s3.listObjectsV2
+        Bucket:     bucket
+        Prefix:     prefix
+        MaxKeys:    limit
+        StartAfter: startAfter
+        FetchOwner: fetchOwner
 
     .tapCatch (error) ->
       log.error S3.list-error: {} bucket, prefix, startAfter, limit, error
@@ -183,6 +269,7 @@ class S3 extends BaseClass
         sdkCopyOptions:           @_getCommonCopyOptionsForSdk options
         largeCopyPartSize:        options.largeCopyPartSize
         largeCopyPartConcurrency: options.largeCopyPartConcurrency
+        onTransientFailure:       options.onTransientFailure
 
     else
       copyOptions = merge
@@ -250,12 +337,14 @@ class S3 extends BaseClass
           streamQueueSize: options.streamQueueSize
 
       else
-        toS3.s3.copyObject copyOptions
+        doCopy = -> toS3.s3.copyObject copyOptions
+        @_withTransientRetry "copy #{toBucket}/#{toKey}", doCopy, options.onTransientFailure
 
   delete: (options) ->
-    @s3.deleteObject
-      Bucket: options.bucket
-      Key:    options.key
+    @_withTransientRetry "delete #{options.bucket}/#{options.key}", =>
+      @s3.deleteObject
+        Bucket: options.bucket
+        Key:    options.key
 
   ## largeCopy
     Server-side multipart copy: createMultipartUpload -> parallel uploadPartCopy
@@ -313,15 +402,17 @@ class S3 extends BaseClass
 
     .then ({UploadId}) =>
       Promise.all array {PartNumber, CopySourceRange} in-array parts
-        partPwp.queue ->
-          toS3.s3.uploadPartCopy {}
-            Bucket:     toBucket
-            Key:        toKey
-            UploadId
-            PartNumber
-            CopySource: copySource
-            CopySourceRange
-          .then ({CopyPartResult}) -> {} PartNumber, ETag: CopyPartResult.ETag
+        partPwp.queue =>
+          doUploadPart = ->
+            toS3.s3.uploadPartCopy {}
+              Bucket:     toBucket
+              Key:        toKey
+              UploadId
+              PartNumber
+              CopySource: copySource
+              CopySourceRange
+            .then ({CopyPartResult}) -> {} PartNumber, ETag: CopyPartResult.ETag
+          @_withTransientRetry "uploadPartCopy #{toBucket}/#{toKey}#part#{PartNumber}", doUploadPart, options.onTransientFailure
 
       .then (completedParts) ->
         toS3.s3.completeMultipartUpload

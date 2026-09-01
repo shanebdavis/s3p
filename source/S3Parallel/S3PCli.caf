@@ -113,6 +113,7 @@ advancedOptionsForAll =
   list-concurrency:        advanced: true argument: :100     description: ""Maximum number of simultaneous list operations
   max-list-requests:       advanced: true argument: :number  description: "" Not set by default; If set, will stop when hit. Use to limit how many requests get used.
   max-sockets:             advanced: true argument: :number  description: "" Maximum concurrent HTTP connections to S3. Defaults to match the operation's concurrency options: list-concurrency for list-only commands, copy-concurrency + list-concurrency for copy/sync, delete-concurrency + list-concurrency for delete.
+  max-attempts:            advanced: true argument: :5       description: "" Total tries per S3 request (1 initial + retries) using the SDK's adaptive retry mode. At high concurrency, S3 and the network transiently drop connections ("socket hang up" / TimeoutError); these are retryable and usually recover on the next try, so s3p retries rather than aborting the whole operation. Raise for very high concurrency or flaky networks; lower to fail faster.
 
 advancedOptionsForCopy = merge advancedOptionsForAll,
   copy-concurrency:        advanced: true argument: :500       description: "" SERVER-SIDE copy mode only: maximum number of simultaneous small-copies (single copyObject calls). Stream mode ignores this - see --stream-concurrency.
@@ -120,6 +121,7 @@ advancedOptionsForCopy = merge advancedOptionsForAll,
   stream-concurrency:      advanced: true argument: :number    description: "" STREAM mode only: number of files actively streaming through this machine at once. Default: derived from --stream-memory. Streaming many small files? Raise this (or --stream-memory) - the default is sized for worst-case large files.
   stream-memory:           advanced: true argument: :536870912 description: "" STREAM mode only: approximate local memory budget for streaming buffers. Each actively-streaming file buffers up to 4 parts of 16MB (64MB worst-case), so the default 512MB allows 8 concurrent files. Ignored when --stream-concurrency is set explicitly.
   max-queue-size:          advanced: true argument: :50000     description: "" Maximum number of files that can be queued for copying before list-reading is throttled.
+  skip-failed-transient-copies: advanced: true description: "" By default, a copy that keeps failing with a transient connection error (see --max-attempts) after all its retries is FATAL - it aborts the run, because skipping it leaves an INCOMPLETE copy. Set this flag to instead SKIP such files (logged individually and counted in finalStats.transientCopyFailureFiles/Bytes) and continue; re-run sync afterwards to pick them up. Prefer lowering --copy-concurrency/--list-concurrency first if you see many transient failures.
   large-copy-threshold:    advanced: true argument: :104857600 description:
     ""
       Files at or above this byte-size use the large-copy strategy: server-side parallel

@@ -392,6 +392,12 @@ class S3P
       copyPwp
       largeCopyPwp
       largeCopyThreshold
+      # opt-in: continue past copies that exhaust their transient-error retries,
+      # instead of aborting. Default false: an exhausted transient copy is fatal,
+      # because skipping it produces an INCOMPLETE copy and that must be a
+      # conscious choice. When true, such files are logged and counted in
+      # finalStats.transientCopyFailure{Files,Bytes} and the run continues.
+      skipFailedTransientCopies = false
 
       # s3 options
       region
@@ -546,6 +552,27 @@ class S3P
               stats.keyDoesNotExistBytes =
                 stats.keyDoesNotExistBytes ? 0
                 + Size
+
+            else if s3._isTransientError error
+              # transient connection error that exhausted all retries (see S3._withTransientRetry).
+              unless skipFailedTransientCopies
+                # DEFAULT: fatal. Skipping would leave an incomplete copy silently;
+                # abort so the incompleteness is a conscious, opt-in choice.
+                log.error "" s3p: ABORTING - transient copy failure after retries: s3://#{options.toBucket}/#{key} (#{humanByteSize Size}) - #{error.name}: #{error.message}. Re-run, lower --copy-concurrency/--list-concurrency, or pass --skip-failed-transient-copies to skip and continue.
+                throw error
+
+              # opt-in: record the skipped file and continue (a re-sync will pick it up)
+              log.warn "" s3p: SKIPPED (transient copy failure after retries): s3://#{options.toBucket}/#{key} (#{humanByteSize Size}) - #{error.name}: #{error.message}
+              stats.transientCopyFailureFiles =
+                stats.transientCopyFailureFiles ? 0
+                + 1
+              stats.transientCopyFailureBytes =
+                stats.transientCopyFailureBytes ? 0
+                + Size
+              stats.transientCopyFailureKeys =
+                stats.transientCopyFailureKeys ? []
+                .concat key
+
             else throw error
 
     .then (stats) ->

@@ -209,3 +209,54 @@ describe
         assert.ok finalStats.failed is Array
         failed = finalStats.failed
         assert.eq 1, failed.length
+
+    ## helper: copy rejects with an (already-retry-exhausted) transient error for specific keys
+    mockS3WithTransientCopy = (keys, failKeys) ->
+      base = mockS3 keys...
+      merge base,
+        copy: (options) ->
+          key = options.key ? options.fromKey
+          if key in failKeys
+            error = new Error "socket hang up"
+            error.name = :TimeoutError
+            Promise.reject error
+          else
+            Promise.resolve {}
+
+        # _copyWrapper consults this to decide transient vs fatal
+        _isTransientError: (error) -> error?.name == :TimeoutError
+        extractCommonCopyOptions: -> {}
+
+    test "exhausted transient copy error is FATAL by default" ->
+      S3P.copy
+        quiet: true
+        bucket: :source-bucket
+        toBucket: :dest-bucket
+        s3: mockS3WithTransientCopy
+          [] :alpha :beta :gamma
+          [] :beta
+        toS3: {} s3: copyObject: -> Promise.resolve {}
+
+      .then ({finalStats}) ->
+        # default: the transient failure propagates to the failed list, not silently skipped
+        assert.ok finalStats.failed is Array
+        assert.eq 1, finalStats.failed.length
+        assert.eq finalStats.transientCopyFailureFiles ? 0, 0
+
+    test "exhausted transient copy error is skipped & recorded with --skip-failed-transient-copies" ->
+      S3P.copy
+        quiet: true
+        skipFailedTransientCopies: true
+        bucket: :source-bucket
+        toBucket: :dest-bucket
+        s3: mockS3WithTransientCopy
+          [] :alpha :beta :gamma
+          [] :beta
+        toS3: {} s3: copyObject: -> Promise.resolve {}
+
+      .then ({finalStats}) ->
+        assert.eq finalStats.copiedFiles, 2
+        assert.eq finalStats.transientCopyFailureFiles, 1
+        assert.eq finalStats.transientCopyFailureBytes, "beta".length # mock Size = key length
+        assert.ok finalStats.transientCopyFailureKeys is Array
+        assert.eq finalStats.transientCopyFailureKeys, [] :beta

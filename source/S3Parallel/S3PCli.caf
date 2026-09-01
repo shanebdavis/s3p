@@ -121,6 +121,7 @@ advancedOptionsForCopy = merge advancedOptionsForAll,
   stream-concurrency:      advanced: true argument: :number    description: "" STREAM mode only: number of files actively streaming through this machine at once. Default: derived from --stream-memory. Streaming many small files? Raise this (or --stream-memory) - the default is sized for worst-case large files.
   stream-memory:           advanced: true argument: :536870912 description: "" STREAM mode only: approximate local memory budget for streaming buffers. Each actively-streaming file buffers up to 4 parts of 16MB (64MB worst-case), so the default 512MB allows 8 concurrent files. Ignored when --stream-concurrency is set explicitly.
   max-queue-size:          advanced: true argument: :50000     description: "" Maximum number of files that can be queued for copying before list-reading is throttled.
+  skip-failed-transient-copies: advanced: true description: "" By default, a copy that keeps failing with a transient connection error (see --max-attempts) after all its retries is FATAL - it aborts the run, because skipping it leaves an INCOMPLETE copy. Set this flag to instead SKIP such files (logged individually and counted in finalStats.transientCopyFailureFiles/Bytes) and continue; re-run sync afterwards to pick them up. Prefer lowering --copy-concurrency/--list-concurrency first if you see many transient failures.
   large-copy-threshold:    advanced: true argument: :104857600 description:
     ""
       Files at or above this byte-size use the large-copy strategy: server-side parallel
